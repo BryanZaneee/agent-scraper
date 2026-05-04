@@ -1,7 +1,8 @@
-"""Scrape any Fextralife wiki to Markdown files.
+"""Scrape wikis and web content to Markdown files.
 
-Works for any Fextralife subdomain (Dark Souls, Elden Ring, Bloodborne,
-Sekiro, etc.). Pick a wiki with --base, then choose a mode:
+Currently optimized for Fextralife wikis (Dark Souls, Elden Ring, Bloodborne,
+Sekiro, etc.). Extensible for other sites. Pick a source with --base, then
+choose a mode:
 
 - Sitemap mode (default): reads /sitemap.xml and scrapes every page into
   a flat output directory.

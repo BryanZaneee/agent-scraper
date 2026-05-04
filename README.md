@@ -1,8 +1,9 @@
-# Fextralife wiki → Markdown scraper
+# Easy Scrape
 
-Scrapes any [Fextralife](https://fextralife.com) wiki subdomain into clean
-Markdown files. Reads only the article body, strips images and scripts,
-rewrites internal links to absolute URLs, and writes one `.md` per page.
+A flexible wiki scraper that converts web content into clean Markdown files.
+Currently supports [Fextralife](https://fextralife.com) wiki subdomains, with
+extensibility for other sites. Reads only the article body, strips images and
+scripts, rewrites internal links to absolute URLs, and writes one `.md` per page.
 
 Tested on Dark Souls, Elden Ring, and Bloodborne — works on any wiki on
 the `*.wiki.fextralife.com` infrastructure.
@@ -14,9 +15,10 @@ python3 -m venv .venv
 .venv/bin/pip install requests beautifulsoup4 markdownify lxml
 ```
 
-## Pick your wiki
+## Pick your source
 
-Use `--base` to point at any Fextralife subdomain. Some examples:
+Use `--base` to point at any wiki or website to scrape. Currently optimized for
+Fextralife subdomains — some examples:
 
 ```
 https://darksouls.wiki.fextralife.com           (Dark Souls — default)

@@ -246,6 +246,7 @@ def test_collect_markdown_corpus_stats_counts_nested_markdown(tmp_path):
     assert stats.bytes == len("abcd efgh".encode("utf-8")) + len(
         "ijkl".encode("utf-8")
     )
+    assert stats.chars == len("abcd efgh") + len("ijkl")
     assert stats.words == 3
     assert stats.estimated_tokens == estimate_token_count(
         "abcd efgh"
@@ -253,7 +254,7 @@ def test_collect_markdown_corpus_stats_counts_nested_markdown(tmp_path):
     assert [file.path.name for file in stats.files] == ["Armor.md", "Sword.md"]
 
 
-def test_token_summary_includes_final_file_count_report(tmp_path, capsys):
+def test_token_summary_includes_final_total_report(tmp_path, capsys):
     (tmp_path / "Weapons").mkdir()
     (tmp_path / "Weapons" / "Sword.md").write_text("abcd efgh", encoding="utf-8")
 
@@ -261,7 +262,11 @@ def test_token_summary_includes_final_file_count_report(tmp_path, capsys):
 
     output = capsys.readouterr().out
     assert "Markdown files: 1" in output
-    assert "Final report: 1 files, 3 estimated tokens" in output
+    assert "Characters: 9" in output
+    assert (
+        "Final report: "
+        "1 total files, 3 total tokens, 2 total words, 9 total chars"
+    ) in output
 
 
 def test_progress_bar_formats_completed_work():
@@ -394,9 +399,17 @@ def test_folder_browser_new_folder_returns_path_without_creating(tmp_path):
 def test_category_picker_state_toggles_and_submits_selection():
     state = CategoryPickerState(["Weapons", "Armor", "Bosses"])
 
+    assert state.option_label(0) == "All"
+    state.handle_key("space")
+    assert state.selected_categories() == ["Weapons", "Armor", "Bosses"]
+
+    state.handle_key("space")
+    assert state.selected_categories() == []
+
+    state.handle_key("down")
     state.handle_key("down")
     state.handle_key("space")
-    assert state.cursor == 1
+    assert state.cursor == 2
     assert state.selected_categories() == ["Armor"]
 
     state.handle_key("a")

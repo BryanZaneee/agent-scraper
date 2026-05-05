@@ -18,6 +18,34 @@ Format per entry:
 
 ---
 
+## 2026-05-05 — Visible all-categories selection and fuller totals
+
+**Context:** The interactive category picker supported selecting every
+discovered category with the `a` key, but users had to know the shortcut. The
+ending report also surfaced files and estimated tokens but did not include the
+full total set the user wanted for handoff and comparison.
+
+**Decision:** Add a synthetic `All` row at the top of the category picker that
+toggles every discovered category without adding `"All"` to the downstream
+category scrape list. Extend Markdown corpus stats with character totals and
+print a final report containing total files, total tokens, total words, and
+total chars.
+
+**Rationale:** Keeping `All` as UI-only preserves the existing category-mode
+pipeline, output-folder layout, and per-category labels while making the common
+"scrape everything discovered" path obvious. Character totals belong in the
+same corpus aggregation that already computes bytes, words, and token
+estimates, so stats-only and post-run reports stay consistent.
+
+**Alternatives considered:** Treating `All` as a real category argument was
+rejected because it would try to fetch a non-existent `/All` hub. Adding a
+second prompt after category discovery was rejected because it would slow down
+the normal picker flow.
+
+**Trade-offs:** The `All` row reflects whether every concrete category is
+selected; it is not written to frontmatter or output paths. Token totals remain
+the scraper's stable estimate based on `~4 chars/token`.
+
 ## 2026-05-05 — TUI output folder browser
 
 **Context:** The first interactive output step still required users to type a

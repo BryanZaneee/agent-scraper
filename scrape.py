@@ -74,6 +74,7 @@ TUI_MIN_HEIGHT = 18
 MAX_RAIN_SPLASHES = 100
 MAX_RECENT_EVENTS = 4
 INTERACTIVE_KEY_POLL_SECONDS = 0.08
+CATEGORY_PICKER_ALL_LABEL = "All"
 
 ANSI_RESET = "\x1b[0m"
 ANSI_CLEAR = "\x1b[2J"
@@ -928,6 +929,7 @@ class MarkdownFileStats:
 
     path: Path
     bytes: int
+    chars: int
     words: int
     estimated_tokens: int
 
@@ -939,6 +941,7 @@ class MarkdownCorpusStats:
     root: Path
     file_count: int
     bytes: int
+    chars: int
     words: int
     estimated_tokens: int
     files: list[MarkdownFileStats]
@@ -954,23 +957,26 @@ def estimate_token_count(text: str) -> int:
 def collect_markdown_corpus_stats(root: Path) -> MarkdownCorpusStats:
     """Count Markdown files under root and estimate their combined token size."""
     files: list[MarkdownFileStats] = []
-    total_bytes = total_words = total_tokens = 0
+    total_bytes = total_chars = total_words = total_tokens = 0
 
     if root.exists():
         for path in sorted(root.rglob("*.md")):
             text = path.read_text(encoding="utf-8")
             byte_count = len(text.encode("utf-8"))
+            char_count = len(text)
             word_count = len(re.findall(r"\S+", text))
             token_count = estimate_token_count(text)
             files.append(
                 MarkdownFileStats(
                     path=path,
                     bytes=byte_count,
+                    chars=char_count,
                     words=word_count,
                     estimated_tokens=token_count,
                 )
             )
             total_bytes += byte_count
+            total_chars += char_count
             total_words += word_count
             total_tokens += token_count
 
@@ -978,6 +984,7 @@ def collect_markdown_corpus_stats(root: Path) -> MarkdownCorpusStats:
         root=root,
         file_count=len(files),
         bytes=total_bytes,
+        chars=total_chars,
         words=total_words,
         estimated_tokens=total_tokens,
         files=files,
@@ -995,6 +1002,7 @@ def print_markdown_corpus_stats(root: Path, *, top_n: int = 5) -> None:
     print(f"  Collection: {stats.root}")
     print(f"  Markdown files: {format_int(stats.file_count)}")
     print(f"  Bytes: {format_int(stats.bytes)}")
+    print(f"  Characters: {format_int(stats.chars)}")
     print(f"  Words: {format_int(stats.words)}")
     print(
         "  Estimated tokens: "
@@ -1003,8 +1011,10 @@ def print_markdown_corpus_stats(root: Path, *, top_n: int = 5) -> None:
     )
     print(
         "  Final report: "
-        f"{format_int(stats.file_count)} files, "
-        f"{format_int(stats.estimated_tokens)} estimated tokens"
+        f"{format_int(stats.file_count)} total files, "
+        f"{format_int(stats.estimated_tokens)} total tokens, "
+        f"{format_int(stats.words)} total words, "
+        f"{format_int(stats.chars)} total chars"
     )
 
     if not stats.files:
@@ -1648,10 +1658,23 @@ class CategoryPickerState:
     message: str = ""
 
     def __post_init__(self) -> None:
-        if self.categories:
-            self.cursor = max(0, min(self.cursor, len(self.categories) - 1))
+        if self.option_count:
+            self.cursor = max(0, min(self.cursor, self.option_count - 1))
         else:
             self.cursor = 0
+
+    @property
+    def option_count(self) -> int:
+        return len(self.categories) + (1 if self.categories else 0)
+
+    @property
+    def all_selected(self) -> bool:
+        return bool(self.categories) and set(self.categories) <= self.selected
+
+    def option_label(self, index: int) -> str:
+        if index == 0 and self.categories:
+            return CATEGORY_PICKER_ALL_LABEL
+        return self.categories[index - 1]
 
     def selected_categories(self) -> list[str]:
         return [name for name in self.categories if name in self.selected]
@@ -1666,14 +1689,22 @@ class CategoryPickerState:
         if key in ("up", "k", "K"):
             self.cursor = max(0, self.cursor - 1)
         elif key in ("down", "j", "J"):
-            self.cursor = min(len(self.categories) - 1, self.cursor + 1)
+            self.cursor = min(self.option_count - 1, self.cursor + 1)
         elif key in (" ", "space"):
-            current = self.categories[self.cursor]
-            if current in self.selected:
-                self.selected.remove(current)
+            if self.cursor == 0:
+                if self.all_selected:
+                    self.selected.clear()
+                    self.message = "Selection cleared."
+                else:
+                    self.selected = set(self.categories)
+                    self.message = "All categories selected."
             else:
-                self.selected.add(current)
-            self.message = ""
+                current = self.categories[self.cursor - 1]
+                if current in self.selected:
+                    self.selected.remove(current)
+                else:
+                    self.selected.add(current)
+                self.message = ""
         elif key in ("a", "A"):
             self.selected = set(self.categories)
             self.message = "All categories selected."
@@ -2190,8 +2221,8 @@ class InteractiveScrapeTui:
         size = shutil.get_terminal_size((80, 24))
         visible_count = max(5, size.lines - 10)
         half = visible_count // 2
-        start = max(0, min(state.cursor - half, len(state.categories) - visible_count))
-        end = min(len(state.categories), start + visible_count)
+        start = max(0, min(state.cursor - half, state.option_count - visible_count))
+        end = min(state.option_count, start + visible_count)
 
         body = [
             f"Source: {base_url}",
@@ -2199,9 +2230,12 @@ class InteractiveScrapeTui:
             "",
         ]
         for idx in range(start, end):
-            name = state.categories[idx]
+            name = state.option_label(idx)
             cursor = ">" if idx == state.cursor else " "
-            mark = "x" if name in state.selected else " "
+            if idx == 0:
+                mark = "x" if state.all_selected else " "
+            else:
+                mark = "x" if name in state.selected else " "
             body.append(f"{cursor} [{mark}] {name}")
         if state.message:
             body.extend(["", state.message])

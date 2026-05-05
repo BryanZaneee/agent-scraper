@@ -52,10 +52,10 @@ multi-select category list. Before scraping starts, it asks where to write the
 files with an in-terminal folder browser. The default action writes to
 `~/Desktop/easy_scrape_output`; you can also browse folders, use the current
 folder, create a named child folder, or type an existing path directly. Use
-`up/down` or `j/k` to move, `space` to toggle categories, `a` to select all,
-`n` to clear categories or name a new output folder, `/` to type an output
-path, `backspace` to browse to a parent folder, `~` for home, `d` for Desktop,
-`enter` to continue, and `q` to quit.
+`up/down` or `j/k` to move, `space` to toggle categories, the `All` row or `a`
+to select all, `n` to clear categories or name a new output folder, `/` to type
+an output path, `backspace` to browse to a parent folder, `~` for home, `d` for
+Desktop, `enter` to continue, and `q` to quit.
 Mouse-wheel events are ignored by the TUI so scrolling does not disturb the
 weather effects or selection.
 
@@ -124,10 +124,10 @@ links; promotes useful image alt text into table labels; normalizes repeated
 game-name headings; and drops placeholder sections such as `N/A` notes.
 
 Every scrape run ends with a token summary for the final Markdown collection:
-Markdown file count, bytes, words, estimated tokens, a compact final
-file/token report, and the largest files. The token estimate is intentionally
-stable and dependency-free (`~4 chars/token`), so you can compare different
-scrape versions and category collections over time.
+Markdown file count, bytes, characters, words, estimated tokens, a compact
+final report with total files/tokens/words/chars, and the largest files. The
+token estimate is intentionally stable and dependency-free (`~4 chars/token`),
+so you can compare different scrape versions and category collections over time.
 
 Interactive terminal scrapes render a structured dashboard with weather effects
 inspired by the sibling `weathr` app: drifting clouds, rain, splashes, and rare

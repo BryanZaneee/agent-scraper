@@ -18,6 +18,133 @@ Format per entry:
 
 ---
 
+## 2026-05-05 — Balanced scrape dashboard TUI
+
+**Context:** The first rain TUI made long runs feel better, but the centered
+box still hid the scrape's actual workflow. It was hard to tell which mode was
+running, where files were going, what stage the current page was in, or how to
+leave the animation without canceling the scrape.
+
+**Decision:** Overhaul the TUI into a dependency-free dashboard. It now tracks
+explicit scrape state (mode, stage, output path, current URL/slug, counters,
+elapsed time, rate, and recent events), adds `weathr`-style cloud and lightning
+effects alongside rain and splashes, and supports basic visual controls:
+`?`/`h` for help, `p` to pause effects only, and `q` to exit the TUI while the
+scrape continues with plain logs.
+
+**Rationale:** Treating the TUI as an observer around the existing scrape flow
+keeps generated Markdown, cache behavior, image downloads, and token summaries
+unchanged. The added stage hooks report what the scraper is already doing
+(fetching, reading cache, cleaning, converting, writing, waiting, summarizing)
+without changing the underlying work.
+
+**Alternatives considered:** A full terminal UI framework was rejected to keep
+the scraper easy to install and dependency-free. Turning `q` into a process
+quit was rejected because `Ctrl-C` already owns cancellation; `q` is safer as a
+visual fallback to plain logs. Making the scene cinematic-first was rejected in
+favor of a balanced dashboard where progress remains readable.
+
+**Trade-offs:** Keyboard controls require an interactive stdin; when unavailable
+the dashboard still renders but controls are inactive. Plain logs resume only
+for pages completed after `q` is pressed, while final counts and token summaries
+still print after the TUI exits.
+
+---
+
+## 2026-05-05 — Animated rain scrape TUI
+
+**Context:** The command-line scraper worked, but long interactive runs were
+plain line-by-line logs. The user wanted the terminal UI improved with a cool
+rain animation, borrowing the proven raindrop/splash behavior from the sibling
+`weathr` repo, while preserving scraper functionality.
+
+**Decision:** Add a dependency-free animated progress UI for interactive scrape
+runs. The new `ScrapeRainTui` uses an ANSI alternate screen, a central
+`easy_scrape` progress panel, saved/skipped/failed counters, current-page
+status, and a Python port of `weathr`'s rain particle ideas: width-scaled drop
+density, wind-influenced horizontal motion, and short-lived splash particles
+when drops hit the panel.
+
+**Rationale:** Keeping the animation as a wrapper around existing progress
+reporting avoids touching fetch, cache, cleanup, image-download, or stats
+behavior. The TUI only activates for real interactive terminals and falls back
+to the original plain logs for redirected output, tiny terminals, `--list-only`,
+`--stats-only`, and `--no-tui`.
+
+**Alternatives considered:** Adding a terminal UI dependency was rejected
+because this project is a single-file scraper with a small requirements list.
+Using curses was avoided for the same reason and because ANSI alternate-screen
+rendering is enough for this progress view. Running the animation for every
+mode was rejected because list/discover/stats output should remain scriptable.
+
+**Trade-offs:** The animation is intentionally visual-only and does not persist
+per-page logs while active; final done counts and token summaries still print
+after the TUI exits. Stderr errors may still appear over the animation if the
+network or image downloader reports a problem.
+
+---
+
+## 2026-05-05 — Post-run Markdown token summaries
+
+**Context:** The scraper output is being used as an AI agent knowledge base,
+and the user wants to compare how much context different scrape collections
+consume across cleanup iterations, categories, and future software versions.
+
+**Decision:** Add a dependency-free Markdown corpus counter. Normal scrape
+runs now print a post-run token summary for the final `--out` directory,
+including Markdown file count, bytes, words, estimated tokens, and the largest
+files by estimated tokens. Add `--stats-only` so existing output folders can be
+compared without fetching or rewriting pages.
+
+**Rationale:** Counting the final Markdown corpus makes the metric useful even
+when pages were skipped because files already existed. A stable `~4 chars/token`
+estimate is not model-perfect, but it is deterministic, cheap, and good enough
+for comparing relative savings between scraper versions and collections.
+
+**Alternatives considered:** Adding `tiktoken` or another model-specific
+tokenizer was deferred to avoid a new dependency and provider-specific counts.
+Counting only newly saved pages was rejected because resumed runs and skipped
+files would under-report the real KB size.
+
+**Trade-offs:** Token counts are estimates, not exact model tokenizer counts.
+They should be used for collection-to-collection comparisons and rough context
+budgeting, not for exact billing or provider limit enforcement.
+
+---
+
+## 2026-05-05 — Opt-in content image asset scraping
+
+**Context:** The Dark Souls Maps page exposes useful map files in static HTML
+under `/file/Dark-Souls/...`, but the scraper's clean mode intentionally
+converted all images to alt text or removed them. The user wants those maps
+available as local image assets for AI model workflows while preserving the
+existing text-only default.
+
+**Decision:** Add `--download-images` for clean-mode scrapes. Meaningful
+article images outside tables are downloaded into `<out>/assets/<page-slug>/`,
+rewritten as relative Markdown image references, and labeled from nearby anchor
+or heading text before falling back to `alt`. Table/stat icons continue through
+the existing alt-text cleanup path and are not downloaded.
+
+**Rationale:** Keeping image capture opt-in avoids surprise binary downloads
+for normal KB text scrapes. Storing assets under the scrape output root keeps
+category pages portable (`../assets/...` from category folders) while avoiding
+per-category duplication. The classifier is deliberately conservative: linked
+Fextralife `/file/` images with real dimensions are content, table images are
+labels/icons.
+
+**Alternatives considered:** Downloading every `<img>` was rejected because
+Fextralife uses many small icons as semantic table labels. Keeping only remote
+URLs was rejected because the requested AI workflow needs local image files.
+Adding OCR/caption generation was deferred; the first pass preserves original
+assets and human-readable Markdown references only.
+
+**Trade-offs:** The content-image classifier may miss unusual useful images
+embedded inside tables or served without file extensions. That is safer than
+polluting outputs with icons and can be extended if a real page needs it.
+
+---
+
 ## 2026-05-05 — Documentation aligned with clean-mode output
 
 **Context:** The scraper now produces substantially cleaner AI-KB-oriented

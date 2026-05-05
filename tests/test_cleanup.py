@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -10,14 +11,26 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scrape import (  # noqa: E402
+    ImageAssetContext,
+    ScrapeRainTui,
+    ScrapeTuiState,
+    TerminalRainDrop,
+    TerminalRainSystem,
+    TerminalLightningBolt,
+    asset_filename_from_url,
+    collect_markdown_corpus_stats,
+    estimate_token_count,
     extract_frontmatter,
     extract_main_element,
     format_frontmatter,
     html_to_markdown,
+    progress_bar,
+    scrape_one,
     url_to_title,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def render(fixture: str, url: str, category: str | None = None) -> tuple[str, dict]:
@@ -35,6 +48,7 @@ DRAKE = ("drake-sword.html", "https://darksouls.wiki.fextralife.com/Drake+Sword"
 BELL = ("bell-gargoyle.html", "https://darksouls.wiki.fextralife.com/Bell+Gargoyle", "Bosses")
 EMBERS = ("embers.html", "https://darksouls.wiki.fextralife.com/Embers", "Items")
 ASYLUM = ("asylum-demon.html", "https://darksouls.wiki.fextralife.com/Asylum+Demon", "Bosses")
+MAPS_URL = "https://darksouls.wiki.fextralife.com/Maps"
 
 
 def test_drake_sword_no_footer_nav():
@@ -121,3 +135,318 @@ def test_asylum_demon_empty_icon_column_dropped():
     assert location_lines[0].count("|") == 3, (
         f"Location row should be 2-cell after empty-icon-col drop: {location_lines[0]!r}"
     )
+
+
+def test_maps_download_images_as_local_markdown_refs(tmp_path):
+    html = (FIXTURES / "maps.html").read_text(encoding="utf-8")
+    downloads = []
+
+    def fake_downloader(_session, source_url, dest_path):
+        downloads.append((source_url, dest_path))
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(b"fake image")
+        return True
+
+    ctx = ImageAssetContext(
+        session=object(),
+        asset_dir=tmp_path / "assets" / "Maps",
+        markdown_dir=tmp_path / "Maps",
+        downloader=fake_downloader,
+    )
+    el = extract_main_element(html, MAPS_URL, clean=True, image_assets=ctx)
+    assert el is not None
+    md = html_to_markdown(str(el), title="Maps", clean=True, preserve_images=True)
+
+    assert "![Northern Undead Asylum](../assets/Maps/Northern_AsylumMapV1.jpg)" in md
+    assert "![Sen's Fortress](../assets/Maps/Sen_s_Fortress.png)" in md
+    assert "![World Map](../assets/Maps/dark_souls_entire_map_bosses.png)" in md
+    assert "### Northern Undead Asylum Northern Undead Asylum" not in md
+    assert len(downloads) == 3
+    assert (tmp_path / "assets" / "Maps" / "Northern_AsylumMapV1.jpg").exists()
+
+
+def test_image_download_does_not_capture_stat_icons(tmp_path):
+    html = (FIXTURES / "asylum-demon.html").read_text(encoding="utf-8")
+    downloads = []
+
+    def fake_downloader(_session, source_url, dest_path):
+        downloads.append((source_url, dest_path))
+        return True
+
+    ctx = ImageAssetContext(
+        session=object(),
+        asset_dir=tmp_path / "assets" / "Asylum_Demon",
+        markdown_dir=tmp_path,
+        downloader=fake_downloader,
+    )
+    el = extract_main_element(html, ASYLUM[1], clean=True, image_assets=ctx)
+    assert el is not None
+    md = html_to_markdown(str(el), title="Asylum Demon", clean=True, preserve_images=True)
+
+    assert downloads == []
+    assert "![" not in md
+    assert "Boss 0036 Asylum Demon" not in md
+
+
+def test_asset_filename_from_url_sanitizes_and_deduplicates():
+    seen: set[str] = set()
+
+    assert (
+        asset_filename_from_url(
+            "https://darksouls.wiki.fextralife.com/file/Dark-Souls/"
+            "dark%20souls%20entire%20map%20bosses.png?v=1518927256403",
+            seen,
+        )
+        == "dark_souls_entire_map_bosses.png"
+    )
+    assert (
+        asset_filename_from_url(
+            "https://darksouls.wiki.fextralife.com/file/Dark-Souls/"
+            "Sen's_Fortress.png",
+            seen,
+        )
+        == "Sen_s_Fortress.png"
+    )
+    assert (
+        asset_filename_from_url(
+            "https://darksouls.wiki.fextralife.com/file/Dark-Souls/"
+            "Sen's_Fortress.png?download=1",
+            seen,
+        )
+        == "Sen_s_Fortress_2.png"
+    )
+
+
+def test_collect_markdown_corpus_stats_counts_nested_markdown(tmp_path):
+    (tmp_path / "Weapons").mkdir()
+    (tmp_path / "Weapons" / "Sword.md").write_text("abcd efgh", encoding="utf-8")
+    (tmp_path / "Armor.md").write_text("ijkl", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("ignored", encoding="utf-8")
+
+    stats = collect_markdown_corpus_stats(tmp_path)
+
+    assert stats.file_count == 2
+    assert stats.bytes == len("abcd efgh".encode("utf-8")) + len(
+        "ijkl".encode("utf-8")
+    )
+    assert stats.words == 3
+    assert stats.estimated_tokens == estimate_token_count(
+        "abcd efgh"
+    ) + estimate_token_count("ijkl")
+    assert [file.path.name for file in stats.files] == ["Armor.md", "Sword.md"]
+
+
+def test_progress_bar_formats_completed_work():
+    assert progress_bar(2, 4, 10) == "[####....]"
+    assert progress_bar(0, 0, 6) == "[....]"
+
+
+def test_rain_system_splashes_on_tui_panel():
+    class AlwaysSplash:
+        def random(self):
+            return 0.0
+
+    rain = TerminalRainSystem()
+    rain._target_count = lambda _width: 0
+    rain.rng = AlwaysSplash()
+    rain.drops = [
+        TerminalRainDrop(
+            x=10,
+            y=4.5,
+            speed_y=1.0,
+            speed_x=0.0,
+            character="|",
+            color="white",
+            z_index=1,
+        )
+    ]
+
+    rain.update(40, 20, (5, 20, 5), speed=1.0)
+
+    assert rain.drops == []
+    assert [(s.x, s.y) for s in rain.splashes] == [(10, 5)]
+
+
+def test_rain_tui_is_inert_for_non_tty_stream():
+    class FakeStream:
+        def __init__(self):
+            self.writes = []
+
+        def isatty(self):
+            return False
+
+        def write(self, text):
+            self.writes.append(text)
+
+        def flush(self):
+            pass
+
+    stream = FakeStream()
+    with ScrapeRainTui(enabled=True, stream=stream) as tui:
+        tui.start_batch("Title", "Subtitle", 3)
+        tui.start_page(
+            1,
+            3,
+            "https://example.test",
+            "Example",
+            saved=0,
+            skipped=0,
+            failed=0,
+        )
+        tui.finish_page("saved", "Example", saved=1, skipped=0, failed=0)
+
+    assert not tui.active
+    assert stream.writes == []
+
+
+def test_tui_q_switches_to_plain_logs_without_failure():
+    class FakeTty:
+        def isatty(self):
+            return True
+
+        def write(self, _text):
+            pass
+
+        def flush(self):
+            pass
+
+    tui = ScrapeRainTui(enabled=True, stream=FakeTty())
+    tui.start_batch("Title", "Subtitle", 3)
+
+    tui.handle_key("q")
+
+    state = tui.snapshot()
+    assert not tui.active
+    assert tui.plain_requested
+    assert state.failed == 0
+
+
+def test_tui_pause_does_not_block_state_updates():
+    class FakeTty:
+        def isatty(self):
+            return True
+
+        def write(self, _text):
+            pass
+
+        def flush(self):
+            pass
+
+    tui = ScrapeRainTui(enabled=True, stream=FakeTty())
+    tui.start_batch("Title", "Subtitle", 2)
+
+    tui.handle_key("p")
+    tui.start_page(1, 2, "https://example.test/a", "a", saved=0, skipped=0, failed=0)
+    tui.finish_page("saved", "a", saved=1, skipped=0, failed=0)
+
+    state = tui.snapshot()
+    assert tui.paused
+    assert state.saved == 1
+    assert state.index == 1
+    assert state.stage == "saved"
+
+
+def test_tui_help_frame_fits_supported_narrow_terminal():
+    tui = ScrapeRainTui(enabled=False)
+    tui.handle_key("?")
+    state = ScrapeTuiState(
+        title="Category: Maps",
+        mode="category",
+        stage="fetching page",
+        output_path="/tmp/out",
+        current_url="https://example.test/maps",
+        current_slug="Maps",
+        total=3,
+        index=1,
+        saved=0,
+        skipped=0,
+        failed=0,
+    )
+
+    frame = tui._draw_frame(60, 18, state)
+    plain_lines = [ANSI_RE.sub("", line) for line in frame.splitlines()]
+
+    assert len(plain_lines) == 18
+    assert all(len(line) == 60 for line in plain_lines)
+    assert "easy_scrape controls" in "\n".join(plain_lines)
+
+
+def test_tui_redraws_dashboard_text_over_storm_effects():
+    tui = ScrapeRainTui(enabled=False)
+    tui._paused = True
+    tui._storm.bolts = [
+        TerminalLightningBolt(
+            segments=[(30, 8, "|"), (31, 9, "\\"), (32, 10, "|")],
+            age=0,
+            max_age=10,
+        )
+    ]
+    tui._storm.flash_active = True
+    state = ScrapeTuiState(
+        title="Sitemap scrape",
+        mode="sitemap",
+        stage="fetching page",
+        output_path="/tmp/out",
+        detail="https://example.test/current",
+        current_url="https://example.test/current",
+        current_slug="Current Page",
+        total=10,
+        index=4,
+        saved=3,
+        skipped=0,
+        failed=0,
+    )
+
+    frame = ANSI_RE.sub("", tui._draw_frame(80, 24, state))
+
+    assert "Sitemap scrape" in frame
+    assert "current: Current Page" in frame
+    assert "FETCHING PAGE" in frame
+
+
+def test_tui_hooks_do_not_change_scraped_output(tmp_path):
+    html = (FIXTURES / "asylum-demon.html").read_text(encoding="utf-8")
+
+    class FakeResponse:
+        status_code = 200
+        text = html
+        headers = {}
+        content = html.encode("utf-8")
+
+        def raise_for_status(self):
+            pass
+
+    class FakeSession:
+        def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    class FakeTty:
+        def isatty(self):
+            return True
+
+        def write(self, _text):
+            pass
+
+        def flush(self):
+            pass
+
+    plain_path = tmp_path / "plain" / "Asylum Demon.md"
+    tui_path = tmp_path / "tui" / "Asylum Demon.md"
+    url = ASYLUM[1]
+    session = FakeSession()
+
+    plain_result = scrape_one(session, url, plain_path, overwrite=True, category="Bosses")
+    tui = ScrapeRainTui(enabled=True, stream=FakeTty())
+    tui.start_batch("Category: Bosses", "1 page", 1)
+    tui.start_page(1, 1, url, "Asylum Demon", saved=0, skipped=0, failed=0)
+    tui_result = scrape_one(
+        session,
+        url,
+        tui_path,
+        overwrite=True,
+        category="Bosses",
+        tui=tui,
+    )
+
+    assert plain_result == tui_result == "saved"
+    assert plain_path.read_text(encoding="utf-8") == tui_path.read_text(encoding="utf-8")

@@ -19,11 +19,22 @@ In all modes the scraper extracts only the article body
 from __future__ import annotations
 
 import argparse
+import math
+import os
+import random
 import re
+import select
+import signal
+import shutil
 import sys
+import termios
+import threading
 import time
+import tty
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, TextIO
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
@@ -47,6 +58,36 @@ SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 CONTENT_SELECTOR = "#wiki-content-block"
 SIDEBAR_SELECTORS = (".wiki-menu-2-left", ".sidebar-nav")
 FILENAME_FORBIDDEN = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+ASSET_FILENAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+CONTENT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+CONTENT_IMAGE_MIN_DIMENSION = 80
+PRESERVED_IMAGE_ATTR = "data-easy-scrape-preserved-image"
+TOKEN_CHARS_PER_TOKEN = 4
+TUI_FRAME_SECONDS = 1 / 18
+TUI_MIN_WIDTH = 60
+TUI_MIN_HEIGHT = 18
+MAX_RAIN_SPLASHES = 100
+MAX_RECENT_EVENTS = 4
+
+ANSI_RESET = "\x1b[0m"
+ANSI_CLEAR = "\x1b[2J"
+ANSI_HOME = "\x1b[H"
+ANSI_HIDE_CURSOR = "\x1b[?25l"
+ANSI_SHOW_CURSOR = "\x1b[?25h"
+ANSI_ALT_SCREEN = "\x1b[?1049h"
+ANSI_MAIN_SCREEN = "\x1b[?1049l"
+
+ANSI_COLORS = {
+    "reset": "\x1b[0m",
+    "dim": "\x1b[2m",
+    "cyan": "\x1b[36m",
+    "blue": "\x1b[34m",
+    "white": "\x1b[37m",
+    "green": "\x1b[32m",
+    "yellow": "\x1b[33m",
+    "red": "\x1b[31m",
+    "magenta": "\x1b[35m",
+}
 
 # Paths inside category hub pages that are not member content (sidebar nav,
 # meta-pages, etc.). Member URLs containing any of these are dropped.
@@ -60,6 +101,194 @@ HUB_LINK_BLOCKLIST = (
     "/To+Do+List",
     "/Help",
 )
+
+
+def _parse_dimension(value) -> int | None:
+    """Return the leading integer from an HTML dimension attribute."""
+    if value is None:
+        return None
+    match = re.match(r"\s*(\d+)", str(value))
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _image_source_url(img, page_url: str) -> str | None:
+    """Return the best source URL for an <img>, resolved against page_url."""
+    for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+        raw = (img.get(attr) or "").strip()
+        if raw and not raw.startswith("data:"):
+            return urljoin(page_url, raw)
+    return None
+
+
+def _url_has_content_image_extension(url: str) -> bool:
+    return Path(urlparse(url).path).suffix.lower() in CONTENT_IMAGE_EXTENSIONS
+
+
+def asset_filename_from_url(source_url: str, seen: set[str] | None = None) -> str:
+    """Return a stable, safe local filename for a downloaded image URL."""
+    raw_name = Path(unquote(urlparse(source_url).path)).name or "image"
+    stem, ext = os.path.splitext(raw_name)
+    ext = ext.lower()
+    stem = ASSET_FILENAME_UNSAFE.sub("_", stem)
+    stem = re.sub(r"_+", "_", stem).strip("._-") or "image"
+    ext = ASSET_FILENAME_UNSAFE.sub("", ext)
+    base = stem[:160]
+    suffix = ext[:20]
+    candidate = f"{base}{suffix}"
+
+    if seen is None:
+        return candidate
+
+    counter = 2
+    while candidate in seen:
+        candidate = f"{base}_{counter}{suffix}"
+        counter += 1
+    seen.add(candidate)
+    return candidate
+
+
+def download_image_asset(
+    session: requests.Session, source_url: str, dest_path: Path
+) -> bool:
+    """Download one image asset. Returns False instead of raising on failure."""
+    if dest_path.exists() and dest_path.stat().st_size > 0:
+        return True
+    try:
+        r = session.get(source_url, timeout=30)
+        if r.status_code == 404:
+            print(f"  404 image {source_url}", file=sys.stderr)
+            return False
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  image HTTP error {source_url}: {e}", file=sys.stderr)
+        return False
+
+    content_type = (r.headers.get("content-type") or "").split(";", 1)[0].lower()
+    if content_type and not content_type.startswith("image/"):
+        print(
+            f"  skipping non-image response {source_url}: {content_type}",
+            file=sys.stderr,
+        )
+        return False
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_bytes(r.content)
+    return True
+
+
+@dataclass
+class ImageAssetContext:
+    """State needed to download page images and rewrite them as local refs."""
+
+    session: requests.Session
+    asset_dir: Path
+    markdown_dir: Path
+    downloader: Callable[[requests.Session, str, Path], bool] = download_image_asset
+    seen_filenames: set[str] = field(default_factory=set)
+
+
+def _element_text(element) -> str:
+    return " ".join(element.get_text(" ", strip=True).split())
+
+
+def _image_label(img, source_url: str) -> str:
+    """Pick the least noisy image label available in nearby page markup."""
+    parent_anchor = img.find_parent("a")
+    if parent_anchor:
+        text = _element_text(parent_anchor)
+        if text:
+            return text
+
+    heading = img.find_previous(["h1", "h2", "h3", "h4"])
+    if heading:
+        text = _element_text(heading)
+        if text:
+            return text
+
+    alt = (img.get("alt") or "").strip()
+    if alt:
+        return " ".join(alt.split())
+
+    name = Path(unquote(urlparse(source_url).path)).stem
+    name = re.sub(r"[_\-]+", " ", name).strip()
+    return name or "Image"
+
+
+def _is_meaningful_content_image(img, source_url: str, page_url: str) -> bool:
+    """True for page-owned content images; false for stat/table icons."""
+    if img.find_parent("table"):
+        return False
+
+    source_path = urlparse(source_url).path.lower()
+    source_is_file_image = (
+        "/file/" in source_path and _url_has_content_image_extension(source_url)
+    )
+
+    linked_file_image = False
+    parent_anchor = img.find_parent("a", href=True)
+    if parent_anchor:
+        href_url = urljoin(page_url, parent_anchor["href"])
+        href_path = urlparse(href_url).path.lower()
+        linked_file_image = (
+            "/file/" in href_path and _url_has_content_image_extension(href_url)
+        )
+
+    if not (source_is_file_image or linked_file_image):
+        return False
+
+    width = _parse_dimension(img.get("width"))
+    height = _parse_dimension(img.get("height"))
+    if width is not None and height is not None:
+        return (
+            width >= CONTENT_IMAGE_MIN_DIMENSION
+            and height >= CONTENT_IMAGE_MIN_DIMENSION
+        )
+    if width is not None:
+        return width >= CONTENT_IMAGE_MIN_DIMENSION
+    if height is not None:
+        return height >= CONTENT_IMAGE_MIN_DIMENSION
+    return True
+
+
+def preserve_content_images(
+    element, page_url: str, image_assets: ImageAssetContext
+) -> None:
+    """Download meaningful content images and rewrite <img> tags to local paths."""
+    for img in list(element.find_all("img")):
+        source_url = _image_source_url(img, page_url)
+        if not source_url:
+            continue
+        if not _is_meaningful_content_image(img, source_url, page_url):
+            continue
+
+        filename = asset_filename_from_url(source_url, image_assets.seen_filenames)
+        asset_path = image_assets.asset_dir / filename
+        if not image_assets.downloader(image_assets.session, source_url, asset_path):
+            continue
+
+        rel_path = os.path.relpath(asset_path, start=image_assets.markdown_dir)
+        img["src"] = rel_path.replace(os.sep, "/")
+        img["alt"] = _image_label(img, source_url)
+        img[PRESERVED_IMAGE_ATTR] = "1"
+        for attr in (
+            "data-src",
+            "data-original",
+            "data-lazy-src",
+            "srcset",
+            "style",
+            "title",
+            "width",
+            "height",
+        ):
+            if img.has_attr(attr):
+                del img[attr]
+
+        heading = img.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"])
+        if heading is not None:
+            img.extract()
+            heading.insert_after(img)
 
 
 def expand_rowspans(element) -> None:
@@ -111,6 +340,8 @@ def replace_images_with_alt(element) -> None:
     the rendered markdown table is readable.
     """
     for img in list(element.find_all("img")):
+        if img.get(PRESERVED_IMAGE_ATTR) == "1":
+            continue
         alt = (img.get("alt") or "").strip()
         if not alt:
             img.decompose()
@@ -664,7 +895,994 @@ def url_to_title(url: str) -> str:
     return unquote(path).replace("+", " ").replace("_", " ") or "Index"
 
 
-def extract_main_element(html: str, page_url: str, *, clean: bool = True):
+@dataclass
+class MarkdownFileStats:
+    """Token estimate details for one generated Markdown file."""
+
+    path: Path
+    bytes: int
+    words: int
+    estimated_tokens: int
+
+
+@dataclass
+class MarkdownCorpusStats:
+    """Aggregate token estimate details for a Markdown output collection."""
+
+    root: Path
+    file_count: int
+    bytes: int
+    words: int
+    estimated_tokens: int
+    files: list[MarkdownFileStats]
+
+
+def estimate_token_count(text: str) -> int:
+    """Return a stable rough token estimate for comparing Markdown corpora."""
+    if not text:
+        return 0
+    return math.ceil(len(text) / TOKEN_CHARS_PER_TOKEN)
+
+
+def collect_markdown_corpus_stats(root: Path) -> MarkdownCorpusStats:
+    """Count Markdown files under root and estimate their combined token size."""
+    files: list[MarkdownFileStats] = []
+    total_bytes = total_words = total_tokens = 0
+
+    if root.exists():
+        for path in sorted(root.rglob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            byte_count = len(text.encode("utf-8"))
+            word_count = len(re.findall(r"\S+", text))
+            token_count = estimate_token_count(text)
+            files.append(
+                MarkdownFileStats(
+                    path=path,
+                    bytes=byte_count,
+                    words=word_count,
+                    estimated_tokens=token_count,
+                )
+            )
+            total_bytes += byte_count
+            total_words += word_count
+            total_tokens += token_count
+
+    return MarkdownCorpusStats(
+        root=root,
+        file_count=len(files),
+        bytes=total_bytes,
+        words=total_words,
+        estimated_tokens=total_tokens,
+        files=files,
+    )
+
+
+def format_int(value: int) -> str:
+    return f"{value:,}"
+
+
+def print_markdown_corpus_stats(root: Path, *, top_n: int = 5) -> None:
+    """Print a Repomix-style post-run summary for generated Markdown."""
+    stats = collect_markdown_corpus_stats(root)
+    print("\nToken summary")
+    print(f"  Collection: {stats.root}")
+    print(f"  Markdown files: {format_int(stats.file_count)}")
+    print(f"  Bytes: {format_int(stats.bytes)}")
+    print(f"  Words: {format_int(stats.words)}")
+    print(
+        "  Estimated tokens: "
+        f"{format_int(stats.estimated_tokens)} "
+        f"(~{TOKEN_CHARS_PER_TOKEN} chars/token)"
+    )
+
+    if not stats.files:
+        return
+
+    print(f"  Largest files:")
+    root_resolved = root.resolve()
+    largest = sorted(stats.files, key=lambda f: f.estimated_tokens, reverse=True)[:top_n]
+    for file_stats in largest:
+        try:
+            label = file_stats.path.resolve().relative_to(root_resolved)
+        except ValueError:
+            label = file_stats.path
+        print(
+            "    "
+            f"{format_int(file_stats.estimated_tokens)} tokens  "
+            f"{label}"
+        )
+
+
+@dataclass
+class TerminalRainDrop:
+    x: float
+    y: float
+    speed_y: float
+    speed_x: float
+    character: str
+    color: str
+    z_index: int
+
+
+@dataclass
+class TerminalRainSplash:
+    x: int
+    y: int
+    timer: int
+    max_timer: int
+
+
+@dataclass
+class TerminalCloud:
+    x: float
+    y: int
+    speed: float
+    shape: list[str]
+    color: str
+
+
+@dataclass
+class TerminalLightningBolt:
+    segments: list[tuple[int, int, str]]
+    age: int
+    max_age: int
+
+
+@dataclass
+class ScrapeTuiState:
+    title: str = "easy_scrape"
+    mode: str = "starting"
+    stage: str = "warming up"
+    output_path: str = ""
+    detail: str = ""
+    current_url: str = ""
+    current_slug: str = ""
+    last_result: str = ""
+    total: int = 0
+    index: int = 0
+    saved: int = 0
+    skipped: int = 0
+    failed: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+    recent_events: list[str] = field(default_factory=list)
+
+
+class TerminalCanvas:
+    """Tiny ANSI canvas used by the optional scrape TUI."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.cells: list[list[tuple[str, str | None]]] = [
+            [(" ", None) for _ in range(width)] for _ in range(height)
+        ]
+
+    def set(self, x: int, y: int, ch: str, color: str | None = None) -> None:
+        if 0 <= x < self.width and 0 <= y < self.height:
+            self.cells[y][x] = (ch[:1] or " ", color)
+
+    def text(self, x: int, y: int, text: str, color: str | None = None) -> None:
+        if y < 0 or y >= self.height:
+            return
+        for offset, ch in enumerate(text):
+            self.set(x + offset, y, ch, color)
+
+    def hline(self, x: int, y: int, width: int, ch: str, color: str | None = None) -> None:
+        for offset in range(max(0, width)):
+            self.set(x + offset, y, ch, color)
+
+    def vline(self, x: int, y: int, height: int, ch: str, color: str | None = None) -> None:
+        for offset in range(max(0, height)):
+            self.set(x, y + offset, ch, color)
+
+    def fill_rect(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        ch: str = " ",
+        color: str | None = None,
+    ) -> None:
+        for row in range(max(0, height)):
+            for col in range(max(0, width)):
+                self.set(x + col, y + row, ch, color)
+
+    def box(self, x: int, y: int, width: int, height: int, color: str | None = None) -> None:
+        if width < 2 or height < 2:
+            return
+        self.hline(x + 1, y, width - 2, "-", color)
+        self.hline(x + 1, y + height - 1, width - 2, "-", color)
+        self.vline(x, y + 1, height - 2, "|", color)
+        self.vline(x + width - 1, y + 1, height - 2, "|", color)
+        self.set(x, y, "+", color)
+        self.set(x + width - 1, y, "+", color)
+        self.set(x, y + height - 1, "+", color)
+        self.set(x + width - 1, y + height - 1, "+", color)
+
+    def render(self) -> str:
+        lines: list[str] = []
+        current_color: str | None = None
+        for row in self.cells:
+            parts: list[str] = []
+            for ch, color in row:
+                if color != current_color:
+                    parts.append(ANSI_COLORS.get(color or "reset", ANSI_RESET))
+                    current_color = color
+                parts.append(ch)
+            if current_color is not None:
+                parts.append(ANSI_RESET)
+                current_color = None
+            lines.append("".join(parts))
+        return "\n".join(lines)
+
+
+class TerminalRainSystem:
+    """Port of weathr's raindrop/splash particle idea to this Python CLI.
+
+    The important pieces borrowed from `weathr/src/animation/raindrops.rs` are
+    width-scaled particle counts, wind-adjusted x velocity, and short-lived
+    splash particles. Here, drops splash on the progress panel's top border so
+    the animation visually hits the easy_scrape TUI instead of the terminal
+    floor only.
+    """
+
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self.drops: list[TerminalRainDrop] = []
+        self.splashes: list[TerminalRainSplash] = []
+        self.rng = rng or random.Random()
+        self.wind_x = 0.08 if self.rng.random() > 0.5 else -0.08
+
+    def _target_count(self, width: int) -> int:
+        return max(18, int(width * 0.85))
+
+    def _spawn_drop(self, width: int) -> None:
+        x = self.rng.randrange(max(1, width * 2)) - (width * 0.5)
+        z_index = 1 if self.rng.random() > 0.45 else 0
+        if z_index == 1:
+            chars = ["|", ":"]
+            color = "white"
+            speed_y = 0.85
+        else:
+            chars = [":", "."]
+            color = "blue"
+            speed_y = 0.52
+        self.drops.append(
+            TerminalRainDrop(
+                x=x,
+                y=0.0,
+                speed_y=speed_y + self.rng.random() * 0.35,
+                speed_x=self.wind_x + (self.rng.random() * 0.08 - 0.04),
+                character=self.rng.choice(chars),
+                color=color,
+                z_index=z_index,
+            )
+        )
+
+    def update(
+        self,
+        width: int,
+        height: int,
+        impact_rect: tuple[int, int, int] | None = None,
+        *,
+        speed: float = 1.0,
+    ) -> None:
+        if width <= 0 or height <= 1:
+            self.drops.clear()
+            self.splashes.clear()
+            return
+
+        target_count = self._target_count(width)
+        spawn_rate = max(2, min(8, width // 16))
+        for _ in range(spawn_rate):
+            if len(self.drops) < target_count:
+                self._spawn_drop(width)
+
+        next_drops: list[TerminalRainDrop] = []
+        left = right = impact_y = None
+        if impact_rect is not None:
+            left, right, impact_y = impact_rect
+
+        for drop in self.drops:
+            drop.y += drop.speed_y * speed
+            drop.x += drop.speed_x * speed
+
+            hit_panel = (
+                left is not None
+                and right is not None
+                and impact_y is not None
+                and left <= int(drop.x) <= right
+                and drop.y >= impact_y
+            )
+            hit_floor = drop.y >= height - 1
+            out_of_bounds = drop.x < -10 or drop.x > width + 10
+
+            if hit_panel or hit_floor or out_of_bounds:
+                if (hit_panel or hit_floor) and drop.z_index == 1 and self.rng.random() < 0.7:
+                    splash_y = impact_y if hit_panel and impact_y is not None else height - 1
+                    self.splashes.append(
+                        TerminalRainSplash(
+                            x=max(0, min(width - 1, int(drop.x))),
+                            y=max(0, min(height - 1, int(splash_y))),
+                            timer=0,
+                            max_timer=7,
+                        )
+                    )
+                continue
+            next_drops.append(drop)
+
+        self.drops = next_drops
+        self.splashes = self.splashes[-MAX_RAIN_SPLASHES:]
+        live_splashes: list[TerminalRainSplash] = []
+        for splash in self.splashes:
+            splash.timer += 1
+            if splash.timer < splash.max_timer:
+                live_splashes.append(splash)
+        self.splashes = live_splashes
+
+    def render_drops(self, canvas: TerminalCanvas) -> None:
+        for drop in self.drops:
+            x = int(drop.x)
+            y = int(drop.y)
+            if 0 <= x < canvas.width and 0 <= y < canvas.height:
+                ch = (
+                    "\\"
+                    if drop.speed_x > 0.18
+                    else "/"
+                    if drop.speed_x < -0.18
+                    else drop.character
+                )
+                canvas.set(x, y, ch, drop.color)
+
+    def render_splashes(self, canvas: TerminalCanvas) -> None:
+        for splash in self.splashes:
+            ch = "." if splash.timer <= 2 else "o" if splash.timer <= 4 else "O"
+            canvas.set(splash.x, splash.y, ch, "cyan")
+
+
+class TerminalCloudSystem:
+    """Small drifting background layer adapted from weathr's cloud system."""
+
+    SHAPES = [
+        ["   .--.   ", " .-(    ).", "(___.__)_)"],
+        ["      _  _   ", "    ( `   )_ ", "   (    )   `)"],
+        ["     .--.    ", "  .-(    ).  ", " (___.__)__) "],
+    ]
+
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self.rng = rng or random.Random()
+        self.clouds: list[TerminalCloud] = []
+
+    def _spawn_cloud(self, width: int, height: int, *, random_x: bool = False) -> None:
+        shape = [line.rstrip() for line in self.rng.choice(self.SHAPES)]
+        x = self.rng.randrange(max(1, width)) if random_x else -max(len(shape[0]), 8)
+        y_limit = max(2, min(6, height // 3))
+        self.clouds.append(
+            TerminalCloud(
+                x=float(x),
+                y=self.rng.randrange(0, y_limit),
+                speed=0.035 + self.rng.random() * 0.05,
+                shape=shape,
+                color="dim",
+            )
+        )
+
+    def update(self, width: int, height: int, *, speed: float = 1.0) -> None:
+        if width <= 0 or height <= 0:
+            self.clouds.clear()
+            return
+
+        if not self.clouds:
+            for _ in range(max(1, width // 34)):
+                self._spawn_cloud(width, height, random_x=True)
+
+        for cloud in self.clouds:
+            cloud.x += cloud.speed * speed
+
+        self.clouds = [c for c in self.clouds if c.x < width + 4]
+        max_clouds = max(1, width // 30)
+        if len(self.clouds) < max_clouds and self.rng.random() < 0.035:
+            self._spawn_cloud(width, height)
+
+    def render(self, canvas: TerminalCanvas) -> None:
+        for cloud in self.clouds:
+            for row_offset, line in enumerate(cloud.shape):
+                y = cloud.y + row_offset
+                x = int(cloud.x)
+                if y < 0 or y >= canvas.height:
+                    continue
+                for col_offset, ch in enumerate(line):
+                    if ch != " ":
+                        canvas.set(x + col_offset, y, ch, cloud.color)
+
+
+class TerminalStormSystem:
+    """Rare lightning effect, modeled after weathr's thunderstorm state machine."""
+
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self.rng = rng or random.Random()
+        self.bolts: list[TerminalLightningBolt] = []
+        self.timer = 0
+        self.next_strike_in = 90 + self.rng.randrange(120)
+        self.flash_timer = 0
+        self.flash_active = False
+
+    def _generate_bolt(self, width: int, height: int) -> None:
+        if width < 12 or height < 8:
+            return
+        x = self.rng.randrange(5, max(6, width - 5))
+        y = 1
+        segments: list[tuple[int, int, str]] = [(x, y, "+")]
+        max_y = max(4, min(height - 5, height // 2 + 3))
+
+        while y < max_y:
+            direction = self.rng.choice([-1, 0, 1])
+            x = max(2, min(width - 3, x + direction))
+            y += 1
+            ch = "/" if direction < 0 else "\\" if direction > 0 else "|"
+            segments.append((x, y, ch))
+
+            if self.rng.random() < 0.18:
+                branch_x = x
+                branch_y = y
+                branch_direction = -1 if direction >= 0 else 1
+                for _ in range(2):
+                    branch_x = max(1, min(width - 2, branch_x + branch_direction))
+                    branch_y += 1
+                    if branch_y < height - 2:
+                        segments.append(
+                            (
+                                branch_x,
+                                branch_y,
+                                "/" if branch_direction < 0 else "\\",
+                            )
+                        )
+
+        self.bolts.append(TerminalLightningBolt(segments=segments, age=0, max_age=14))
+        self.bolts = self.bolts[-3:]
+        self.flash_active = True
+        self.flash_timer = 3
+
+    def update(
+        self,
+        width: int,
+        height: int,
+        *,
+        active_fetch: bool = False,
+        failed_count: int = 0,
+        speed: float = 1.0,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            self.bolts.clear()
+            return
+
+        if self.flash_timer > 0:
+            self.flash_timer -= 1
+            self.flash_active = True
+        else:
+            self.flash_active = False
+
+        live_bolts: list[TerminalLightningBolt] = []
+        for bolt in self.bolts:
+            bolt.age += 1
+            if bolt.age < bolt.max_age:
+                live_bolts.append(bolt)
+        self.bolts = live_bolts
+
+        self.timer += max(1, int(speed))
+        failure_pressure = min(40, failed_count * 8)
+        active_bonus = 25 if active_fetch else 0
+        if self.timer + failure_pressure + active_bonus >= self.next_strike_in:
+            self._generate_bolt(width, height)
+            self.timer = 0
+            self.next_strike_in = 120 + self.rng.randrange(220)
+
+    def render(self, canvas: TerminalCanvas) -> None:
+        color = "white" if self.flash_active else "yellow"
+        for bolt in self.bolts:
+            for x, y, ch in bolt.segments:
+                canvas.set(x, y, ch, color)
+
+
+def fit_text(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    text = str(text)
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return f"{text[: width - 3]}..."
+
+
+def progress_bar(done: int, total: int, width: int) -> str:
+    if width <= 2:
+        return ""
+    if total <= 0:
+        return "[" + "." * (width - 2) + "]"
+    ratio = max(0.0, min(1.0, done / total))
+    fill = int((width - 2) * ratio)
+    return "[" + "#" * fill + "." * (width - 2 - fill) + "]"
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def percent_done(done: int, total: int) -> str:
+    if total <= 0:
+        return "--%"
+    return f"{min(100.0, max(0.0, done / total * 100)):5.1f}%"
+
+
+def url_host(url: str) -> str:
+    if not url:
+        return ""
+    return urlparse(url).netloc or url
+
+
+class ScrapeRainTui:
+    """Optional animated dashboard. Inert when not attached to a TTY."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        stream: TextIO | None = None,
+        input_stream: TextIO | None = None,
+    ) -> None:
+        self.stream = stream or sys.stdout
+        self.input_stream = input_stream or sys.stdin
+        self.active = bool(enabled and self.stream.isatty())
+        self._state = ScrapeTuiState()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._rain = TerminalRainSystem()
+        self._clouds = TerminalCloudSystem()
+        self._storm = TerminalStormSystem()
+        self._last_size: tuple[int, int] | None = None
+        self._entered = False
+        self._paused = False
+        self._show_help = False
+        self._plain_requested = False
+        self._render_thread: threading.Thread | None = None
+        self._input_thread: threading.Thread | None = None
+        self._stdin_fd: int | None = None
+        self._stdin_attrs = None
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @property
+    def show_help(self) -> bool:
+        return self._show_help
+
+    @property
+    def plain_requested(self) -> bool:
+        return self._plain_requested
+
+    def __enter__(self) -> "ScrapeRainTui":
+        if not self.active:
+            return self
+        size = shutil.get_terminal_size((80, 24))
+        if size.columns < TUI_MIN_WIDTH or size.lines < TUI_MIN_HEIGHT:
+            self.active = False
+            return self
+
+        try:
+            self._enable_input_controls()
+            with self._io_lock:
+                self.stream.write(
+                    ANSI_ALT_SCREEN + ANSI_HIDE_CURSOR + ANSI_CLEAR + ANSI_HOME
+                )
+                self.stream.flush()
+            self._entered = True
+            self._render_thread = threading.Thread(
+                target=self._render_loop,
+                daemon=True,
+                name="easy-scrape-tui-render",
+            )
+            self._render_thread.start()
+            if self._stdin_fd is not None:
+                self._input_thread = threading.Thread(
+                    target=self._input_loop,
+                    daemon=True,
+                    name="easy-scrape-tui-input",
+                )
+                self._input_thread.start()
+        except Exception:
+            self._disable_to_plain_logs(cleanup=True)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self._stop.set()
+        self._join_threads()
+        self._restore_input_controls()
+        if self._entered:
+            with self._io_lock:
+                self.stream.write(
+                    ANSI_RESET
+                    + ANSI_CLEAR
+                    + ANSI_HOME
+                    + ANSI_SHOW_CURSOR
+                    + ANSI_MAIN_SCREEN
+                )
+                self.stream.flush()
+        self._entered = False
+        self.active = False
+
+    def _enable_input_controls(self) -> None:
+        if not self.input_stream.isatty():
+            return
+        try:
+            self._stdin_fd = self.input_stream.fileno()
+            self._stdin_attrs = termios.tcgetattr(self._stdin_fd)
+            tty.setcbreak(self._stdin_fd)
+        except Exception:
+            self._stdin_fd = None
+            self._stdin_attrs = None
+
+    def _restore_input_controls(self) -> None:
+        if self._stdin_fd is None or self._stdin_attrs is None:
+            return
+        try:
+            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._stdin_attrs)
+        except Exception:
+            pass
+        self._stdin_fd = None
+        self._stdin_attrs = None
+
+    def _join_threads(self) -> None:
+        current = threading.current_thread()
+        for thread in (self._input_thread, self._render_thread):
+            if thread is not None and thread is not current:
+                thread.join(timeout=1.0)
+
+    def _disable_to_plain_logs(self, *, cleanup: bool) -> None:
+        self._plain_requested = True
+        self.active = False
+        self._stop.set()
+        if cleanup and self._entered:
+            self._restore_input_controls()
+            with self._io_lock:
+                self.stream.write(
+                    ANSI_RESET
+                    + ANSI_CLEAR
+                    + ANSI_HOME
+                    + ANSI_SHOW_CURSOR
+                    + ANSI_MAIN_SCREEN
+                )
+                self.stream.flush()
+            self._entered = False
+
+    def handle_key(self, key: str) -> None:
+        """Handle one keypress; public for focused unit tests."""
+        if key in ("?", "h", "H"):
+            self._show_help = not self._show_help
+        elif key in ("p", "P"):
+            self._paused = not self._paused
+        elif key in ("q", "Q"):
+            self._disable_to_plain_logs(cleanup=True)
+        elif key == "\x03":
+            os.kill(os.getpid(), signal.SIGINT)
+
+    def _input_loop(self) -> None:
+        while not self._stop.is_set() and self._stdin_fd is not None:
+            try:
+                readable, _, _ = select.select([self.input_stream], [], [], 0.05)
+                if readable:
+                    ch = self.input_stream.read(1)
+                    if ch:
+                        self.handle_key(ch)
+            except Exception:
+                return
+
+    def set_stage(
+        self,
+        title: str | None = None,
+        detail: str = "",
+        stage: str = "",
+        *,
+        mode: str | None = None,
+        output_path: str | Path | None = None,
+    ) -> None:
+        if not self.active:
+            return
+        with self._lock:
+            if title is not None:
+                self._state.title = title or "easy_scrape"
+            if mode is not None:
+                self._state.mode = mode
+            if output_path is not None:
+                self._state.output_path = str(output_path)
+            if detail:
+                self._state.detail = detail
+            if stage:
+                self._state.stage = stage
+
+    def update_stage(self, stage: str, detail: str = "") -> None:
+        if not self.active:
+            return
+        with self._lock:
+            self._state.stage = stage
+            if detail:
+                self._state.detail = detail
+
+    def start_batch(
+        self,
+        title: str,
+        subtitle: str,
+        total: int,
+        *,
+        mode: str | None = None,
+        output_path: str | Path | None = None,
+    ) -> None:
+        if not self.active:
+            return
+        with self._lock:
+            self._state.title = title
+            self._state.detail = subtitle
+            self._state.stage = "ready"
+            self._state.mode = mode or self._state.mode
+            if output_path is not None:
+                self._state.output_path = str(output_path)
+            self._state.current_url = ""
+            self._state.current_slug = ""
+            self._state.last_result = ""
+            self._state.total = total
+            self._state.index = 0
+            self._state.saved = 0
+            self._state.skipped = 0
+            self._state.failed = 0
+            self._state.started_at = time.monotonic()
+            self._state.recent_events = []
+
+    def start_page(
+        self,
+        index: int,
+        total: int,
+        url: str,
+        slug: str,
+        *,
+        saved: int,
+        skipped: int,
+        failed: int,
+    ) -> None:
+        if not self.active:
+            return
+        with self._lock:
+            self._state.index = index
+            self._state.total = total
+            self._state.current_url = url
+            self._state.current_slug = slug
+            self._state.stage = "fetching page"
+            self._state.detail = url
+            self._state.saved = saved
+            self._state.skipped = skipped
+            self._state.failed = failed
+
+    def finish_page(
+        self,
+        result: str,
+        slug: str,
+        *,
+        saved: int,
+        skipped: int,
+        failed: int,
+    ) -> None:
+        if not self.active:
+            return
+        with self._lock:
+            self._state.stage = result
+            self._state.last_result = result
+            self._state.saved = saved
+            self._state.skipped = skipped
+            self._state.failed = failed
+            event = f"{result.upper():7} {slug}"
+            self._state.recent_events.append(event)
+            self._state.recent_events = self._state.recent_events[-MAX_RECENT_EVENTS:]
+
+    def snapshot(self) -> ScrapeTuiState:
+        with self._lock:
+            return ScrapeTuiState(
+                title=self._state.title,
+                mode=self._state.mode,
+                stage=self._state.stage,
+                output_path=self._state.output_path,
+                detail=self._state.detail,
+                current_url=self._state.current_url,
+                current_slug=self._state.current_slug,
+                last_result=self._state.last_result,
+                total=self._state.total,
+                index=self._state.index,
+                saved=self._state.saved,
+                skipped=self._state.skipped,
+                failed=self._state.failed,
+                started_at=self._state.started_at,
+                recent_events=list(self._state.recent_events),
+            )
+
+    def _render_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                width, height = shutil.get_terminal_size((80, 24))
+                frame = self._draw_frame(width, height, self.snapshot())
+                prefix = ANSI_HOME
+                if self._last_size != (width, height):
+                    prefix += ANSI_CLEAR
+                    self._last_size = (width, height)
+                with self._io_lock:
+                    self.stream.write(prefix + frame)
+                    self.stream.flush()
+            except Exception:
+                self._disable_to_plain_logs(cleanup=True)
+                break
+            time.sleep(TUI_FRAME_SECONDS)
+
+    def _draw_frame(self, width: int, height: int, state: ScrapeTuiState) -> str:
+        canvas = TerminalCanvas(width, height)
+        speed = 0.0 if self._paused else 1.0
+        active_fetch = "fetch" in state.stage or "discover" in state.stage
+
+        panel_width = min(max(TUI_MIN_WIDTH - 4, width - 6), 100)
+        panel_height = min(max(12, height - 7), 16)
+        left = max(2, (width - panel_width) // 2)
+        top = max(3, (height - panel_height) // 2)
+        right = left + panel_width - 1
+        bottom = top + panel_height - 1
+        border_color = "white" if self._storm.flash_active else "cyan"
+
+        if not self._paused:
+            self._clouds.update(width, height, speed=0.9)
+            self._rain.update(width, height, (left, right, top), speed=1.25)
+            self._storm.update(
+                width,
+                height,
+                active_fetch=active_fetch,
+                failed_count=state.failed,
+                speed=1.0,
+            )
+
+        self._clouds.render(canvas)
+        self._storm.render(canvas)
+        self._rain.render_drops(canvas)
+        self._draw_ground(canvas, width, height)
+        self._draw_shell(canvas, width, height, state, left, top, panel_width, panel_height, border_color)
+        self._rain.render_splashes(canvas)
+        self._draw_dashboard_text(canvas, state, left, top, panel_width, panel_height)
+        self._draw_footer(canvas, width, height)
+        if self._show_help:
+            self._draw_help(canvas, width, height)
+        return canvas.render()
+
+    def _draw_ground(self, canvas: TerminalCanvas, width: int, height: int) -> None:
+        if height < 3:
+            return
+        ground_y = height - 2
+        for x in range(width):
+            canvas.set(x, ground_y, "~" if x % 2 else "_", "dim")
+
+    def _draw_shell(
+        self,
+        canvas: TerminalCanvas,
+        width: int,
+        height: int,
+        state: ScrapeTuiState,
+        left: int,
+        top: int,
+        panel_width: int,
+        panel_height: int,
+        border_color: str,
+    ) -> None:
+        canvas.text(2, 0, "easy_scrape", "cyan")
+        header = f"mode: {state.mode} | stage: {state.stage}"
+        canvas.text(max(14, width - len(header) - 2), 0, fit_text(header, width - 16), "white")
+        if state.output_path:
+            canvas.text(2, 1, fit_text(f"out: {state.output_path}", width - 4), "dim")
+        canvas.fill_rect(left + 1, top + 1, panel_width - 2, panel_height - 2)
+        canvas.box(left, top, panel_width, panel_height, border_color)
+
+    def _draw_dashboard_text(
+        self,
+        canvas: TerminalCanvas,
+        state: ScrapeTuiState,
+        left: int,
+        top: int,
+        panel_width: int,
+        panel_height: int,
+    ) -> None:
+        inner_x = left + 3
+        inner_width = max(1, panel_width - 6)
+        done = state.saved + state.skipped + state.failed
+        elapsed = time.monotonic() - state.started_at
+        rate = done / elapsed * 60 if elapsed > 0 and done > 0 else 0.0
+        host = url_host(state.current_url)
+
+        title = f" {state.title} "
+        canvas.text(left + max(2, (panel_width - len(title)) // 2), top, title, "white")
+        y = top + 2
+        canvas.text(
+            inner_x,
+            y,
+            fit_text(
+                f"{state.stage.upper()}  {state.index}/{state.total}  {percent_done(done, state.total)}",
+                inner_width,
+            ),
+            "white",
+        )
+        y += 1
+        canvas.text(inner_x, y, progress_bar(done, state.total, inner_width), "green")
+        y += 2
+        canvas.text(
+            inner_x,
+            y,
+            fit_text(
+                f"saved {state.saved}  skipped {state.skipped}  failed {state.failed}",
+                inner_width,
+            ),
+            "yellow" if state.failed == 0 else "red",
+        )
+        y += 1
+        timing = f"elapsed {format_duration(elapsed)}  rate {rate:0.1f} pages/min"
+        canvas.text(inner_x, y, fit_text(timing, inner_width), "dim")
+        y += 2
+        current = state.current_slug or "waiting for first page"
+        canvas.text(inner_x, y, fit_text(f"current: {current}", inner_width), "cyan")
+        y += 1
+        if host:
+            canvas.text(inner_x, y, fit_text(f"host: {host}", inner_width), "dim")
+            y += 1
+        if state.detail and y < top + panel_height - 2:
+            canvas.text(inner_x, y, fit_text(state.detail, inner_width), "dim")
+            y += 1
+
+        if state.recent_events and y < top + panel_height - 2:
+            recent = "recent: " + " | ".join(state.recent_events[-2:])
+            canvas.text(inner_x, y, fit_text(recent, inner_width), "dim")
+
+    def _draw_footer(self, canvas: TerminalCanvas, width: int, height: int) -> None:
+        if height <= 0:
+            return
+        status = "animation paused" if self._paused else "rain/storm effects active"
+        if self._plain_requested:
+            status = "plain logs requested"
+        footer = f"?/h help  p pause effects  q plain logs  Ctrl-C cancel | {status}"
+        canvas.text(2, height - 1, fit_text(footer, width - 4), "dim")
+
+    def _draw_help(self, canvas: TerminalCanvas, width: int, height: int) -> None:
+        help_width = min(72, max(36, width - 4))
+        help_height = 8
+        left = max(2, (width - help_width) // 2)
+        top = max(2, (height - help_height) // 2)
+        canvas.fill_rect(left, top, help_width, help_height)
+        canvas.box(left, top, help_width, help_height, "yellow")
+        lines = [
+            " easy_scrape controls ",
+            "? or h  toggle this help",
+            "p       pause/resume weather effects only",
+            "q       leave TUI and continue with plain logs",
+            "Ctrl-C  cancel the scrape",
+            "Generated files and scraper behavior are unchanged.",
+        ]
+        for offset, line in enumerate(lines):
+            color = "white" if offset == 0 else "dim"
+            canvas.text(left + 2, top + 1 + offset, fit_text(line, help_width - 4), color)
+
+
+def extract_main_element(
+    html: str,
+    page_url: str,
+    *,
+    clean: bool = True,
+    image_assets: ImageAssetContext | None = None,
+):
     """Return the cleaned <#wiki-content-block> element, or None if absent.
 
     With clean=True (default): replaces <img alt> with the alt text (so stat
@@ -678,13 +1896,20 @@ def extract_main_element(html: str, page_url: str, *, clean: bool = True):
 
     if clean:
         expand_rowspans(el)
+        if image_assets is not None:
+            preserve_content_images(el, page_url, image_assets)
         replace_images_with_alt(el)
         drop_banner_alt_rows(el)
         drop_footer_nav_table(el)
         drop_stranded_category_links(el)
 
-    for tag in el.find_all(["img", "script", "style", "noscript", "iframe"]):
+    for tag in el.find_all(["script", "style", "noscript", "iframe"]):
         tag.decompose()
+    for img in list(el.find_all("img")):
+        if img.get(PRESERVED_IMAGE_ATTR) == "1":
+            del img[PRESERVED_IMAGE_ATTR]
+            continue
+        img.decompose()
     for a in el.find_all("a", href=True):
         a["href"] = urljoin(page_url, a["href"])
 
@@ -695,8 +1920,17 @@ def extract_main_element(html: str, page_url: str, *, clean: bool = True):
     return el
 
 
-def html_to_markdown(html_fragment: str, *, title: str = "", clean: bool = True) -> str:
-    md = markdownify(html_fragment, heading_style="ATX", strip=["img"])
+def html_to_markdown(
+    html_fragment: str,
+    *,
+    title: str = "",
+    clean: bool = True,
+    preserve_images: bool = False,
+) -> str:
+    kwargs = {"heading_style": "ATX"}
+    if not preserve_images:
+        kwargs["strip"] = ["img"]
+    md = markdownify(html_fragment, **kwargs)
     md = re.sub(r"\n{3,}", "\n\n", md).strip()
     if clean:
         md = "\n".join(
@@ -717,6 +1951,9 @@ def scrape_one(
     category: str | None = None,
     clean: bool = True,
     cache_dir: Path | None = None,
+    download_images: bool = False,
+    asset_root: Path | None = None,
+    tui: ScrapeRainTui | None = None,
 ) -> str:
     """Return one of: 'saved', 'skipped', 'failed'."""
     if out_path.exists() and not overwrite:
@@ -728,9 +1965,13 @@ def scrape_one(
 
     html_text: str | None = None
     if cache_path is not None and cache_path.exists() and cache_path.stat().st_size > 0:
+        if tui is not None:
+            tui.update_stage("reading cache", str(cache_path))
         html_text = cache_path.read_text(encoding="utf-8")
 
     if html_text is None:
+        if tui is not None:
+            tui.update_stage("fetching page", url)
         try:
             r = session.get(url, timeout=30)
             if r.status_code == 404:
@@ -742,20 +1983,39 @@ def scrape_one(
             return "failed"
         html_text = r.text
         if cache_path is not None:
+            if tui is not None:
+                tui.update_stage("writing cache", str(cache_path))
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(html_text, encoding="utf-8")
 
-    el = extract_main_element(html_text, url, clean=clean)
+    preserve_images = clean and download_images and asset_root is not None
+    image_assets = None
+    if preserve_images:
+        image_assets = ImageAssetContext(
+            session=session,
+            asset_dir=asset_root / out_path.stem,
+            markdown_dir=out_path.parent,
+        )
+
+    if tui is not None:
+        tui.update_stage("cleaning", url)
+    el = extract_main_element(html_text, url, clean=clean, image_assets=image_assets)
     if el is None:
         print(f"  no #wiki-content-block at {url}", file=sys.stderr)
         return "failed"
 
     title = url_to_title(url)
-    md = html_to_markdown(str(el), title=title, clean=clean)
+    if tui is not None:
+        tui.update_stage("converting", title)
+    md = html_to_markdown(
+        str(el), title=title, clean=clean, preserve_images=preserve_images
+    )
     if not md:
         print(f"  empty content at {url}", file=sys.stderr)
         return "failed"
 
+    if tui is not None:
+        tui.update_stage("writing", str(out_path))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if clean:
         fm = extract_frontmatter(el, url=url, title=title, category=category)
@@ -777,6 +2037,9 @@ def scrape_url_list(
     clean: bool = True,
     label: str = "",
     cache_dir: Path | None = None,
+    download_images: bool = False,
+    asset_root: Path | None = None,
+    tui: ScrapeRainTui | None = None,
 ) -> tuple[int, int, int]:
     """Save each URL into out_dir/<slug>.md. Returns (saved, skipped, failed)."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -787,6 +2050,17 @@ def scrape_url_list(
         path = out_dir / f"{slug}.md"
         prefix = f"{label}[{i}/{len(urls)}]" if label else f"[{i}/{len(urls)}]"
 
+        if tui is not None and tui.active:
+            tui.start_page(
+                i,
+                len(urls),
+                url,
+                slug,
+                saved=saved,
+                skipped=skipped,
+                failed=failed,
+            )
+
         result = scrape_one(
             session,
             url,
@@ -795,17 +2069,33 @@ def scrape_url_list(
             category=category,
             clean=clean,
             cache_dir=cache_dir,
+            download_images=download_images,
+            asset_root=asset_root,
+            tui=tui,
         )
         if result == "saved":
             saved += 1
-            print(f"{prefix} saved {slug}.md")
+            if not (tui is not None and tui.active):
+                print(f"{prefix} saved {slug}.md")
         elif result == "skipped":
             skipped += 1
-            print(f"{prefix} skip {slug}")
+            if not (tui is not None and tui.active):
+                print(f"{prefix} skip {slug}")
         else:
             failed += 1
 
+        if tui is not None and tui.active:
+            tui.finish_page(
+                result,
+                slug,
+                saved=saved,
+                skipped=skipped,
+                failed=failed,
+            )
+
         if i < len(urls):
+            if tui is not None:
+                tui.update_stage("waiting", f"{delay:g}s politeness delay")
             time.sleep(delay)
 
     return saved, skipped, failed
@@ -871,6 +2161,14 @@ def parse_args() -> argparse.Namespace:
         help="Print URLs that would be scraped, don't download anything",
     )
     p.add_argument(
+        "--stats-only",
+        action="store_true",
+        help=(
+            "Do not fetch pages. Count existing Markdown files under --out and "
+            "print the token summary."
+        ),
+    )
+    p.add_argument(
         "--discover",
         action="store_true",
         help=(
@@ -888,6 +2186,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--download-images",
+        action="store_true",
+        help=(
+            "Clean mode only: download meaningful article images into "
+            "<out>/assets/<page-slug>/ and keep local Markdown image refs."
+        ),
+    )
+    p.add_argument(
+        "--no-tui",
+        dest="tui",
+        action="store_false",
+        help="Disable the animated rain progress UI and print plain logs.",
+    )
+    p.add_argument(
         "--no-clean",
         dest="clean",
         action="store_false",
@@ -896,12 +2208,16 @@ def parse_args() -> argparse.Namespace:
             "no footer-nav stripping, no heading normalization)."
         ),
     )
-    p.set_defaults(clean=True)
+    p.set_defaults(clean=True, tui=True)
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.stats_only:
+        print_markdown_corpus_stats(args.out)
+        return
+
     session = make_session()
 
     if args.discover:
@@ -925,79 +2241,151 @@ def run_discover_mode(session: requests.Session, args: argparse.Namespace) -> No
 
 def run_category_mode(session: requests.Session, args: argparse.Namespace) -> None:
     total_saved = total_skipped = total_failed = 0
-    for cat in args.category:
-        cat_label = cat.strip("/").replace("+", " ")
-        cat_dir = args.out / cat_label
-        print(f"\n=== Category: {cat_label} → {cat_dir} ===")
+    with ScrapeRainTui(enabled=args.tui and not args.list_only) as tui:
+        for cat in args.category:
+            cat_label = cat.strip("/").replace("+", " ")
+            cat_dir = args.out / cat_label
 
-        try:
-            hub_url, members = fetch_category_member_urls(session, args.base, cat)
-        except requests.RequestException as e:
-            print(f"  failed to fetch hub /{cat}: {e}", file=sys.stderr)
-            total_failed += 1
-            continue
+            if tui.active:
+                tui.set_stage(
+                    f"Category: {cat_label}",
+                    f"Fetching hub /{cat} -> {cat_dir}",
+                    "discovering URLs",
+                    mode="category",
+                    output_path=cat_dir,
+                )
+            else:
+                print(f"\n=== Category: {cat_label} → {cat_dir} ===")
 
-        urls = [hub_url] + members
-        if args.limit:
-            urls = urls[: args.limit]
-        print(f"  {len(urls)} pages (1 hub + {len(urls) - 1} members)")
+            try:
+                hub_url, members = fetch_category_member_urls(session, args.base, cat)
+            except requests.RequestException as e:
+                print(f"  failed to fetch hub /{cat}: {e}", file=sys.stderr)
+                total_failed += 1
+                continue
 
-        if args.list_only:
-            for u in urls:
-                print(f"  {u}")
-            continue
+            urls = [hub_url] + members
+            if args.limit:
+                urls = urls[: args.limit]
 
-        s, k, f = scrape_url_list(
-            session=session,
-            urls=urls,
-            out_dir=cat_dir,
-            delay=args.delay,
-            overwrite=args.overwrite,
-            category=cat_label,
-            clean=args.clean,
-            label=f"  [{cat_label}] ",
-            cache_dir=args.cache_dir,
-        )
-        total_saved += s
-        total_skipped += k
-        total_failed += f
+            if tui.active:
+                tui.start_batch(
+                    f"Category: {cat_label}",
+                    f"{len(urls)} pages (1 hub + {len(urls) - 1} members)",
+                    len(urls),
+                    mode="category",
+                    output_path=cat_dir,
+                )
+            else:
+                print(f"  {len(urls)} pages (1 hub + {len(urls) - 1} members)")
+
+            if args.list_only:
+                for u in urls:
+                    print(f"  {u}")
+                continue
+
+            s, k, f = scrape_url_list(
+                session=session,
+                urls=urls,
+                out_dir=cat_dir,
+                delay=args.delay,
+                overwrite=args.overwrite,
+                category=cat_label,
+                clean=args.clean,
+                label=f"  [{cat_label}] ",
+                cache_dir=args.cache_dir,
+                download_images=args.download_images,
+                asset_root=args.out / "assets",
+                tui=tui,
+            )
+            total_saved += s
+            total_skipped += k
+            total_failed += f
+        if tui.active:
+            tui.update_stage("summarizing", str(args.out))
 
     if not args.list_only:
         print(
             f"\nDone. saved={total_saved} skipped={total_skipped} failed={total_failed}"
         )
+        print_markdown_corpus_stats(args.out)
 
 
 def run_sitemap_mode(session: requests.Session, args: argparse.Namespace) -> None:
     sitemap_url = f"{args.base.rstrip('/')}/sitemap.xml"
-    print(f"Fetching sitemap: {sitemap_url}")
-    urls = fetch_sitemap_urls(session, sitemap_url)
-    print(f"  {len(urls)} URLs in sitemap")
+    with ScrapeRainTui(enabled=args.tui and not args.list_only) as tui:
+        if tui.active:
+            tui.set_stage(
+                "Sitemap scrape",
+                sitemap_url,
+                "fetching sitemap",
+                mode="sitemap",
+                output_path=args.out,
+            )
+        else:
+            print(f"Fetching sitemap: {sitemap_url}")
 
-    if args.filter:
-        pattern = re.compile(args.filter)
-        urls = [u for u in urls if pattern.search(u)]
-        print(f"  {len(urls)} after filter {args.filter!r}")
-    if args.limit:
-        urls = urls[: args.limit]
-        print(f"  {len(urls)} after limit")
+        urls = fetch_sitemap_urls(session, sitemap_url)
+        if tui.active:
+            tui.set_stage(
+                "Sitemap scrape",
+                f"{len(urls)} URLs in sitemap",
+                "preparing",
+                mode="sitemap",
+                output_path=args.out,
+            )
+        else:
+            print(f"  {len(urls)} URLs in sitemap")
 
-    if args.list_only:
-        for u in urls:
-            print(u)
-        return
+        if args.filter:
+            pattern = re.compile(args.filter)
+            urls = [u for u in urls if pattern.search(u)]
+            if tui.active:
+                tui.set_stage(
+                    "Sitemap scrape",
+                    f"{len(urls)} URLs after filter {args.filter!r}",
+                    "filtering",
+                )
+            else:
+                print(f"  {len(urls)} after filter {args.filter!r}")
+        if args.limit:
+            urls = urls[: args.limit]
+            if tui.active:
+                tui.set_stage("Sitemap scrape", f"{len(urls)} URLs after limit", "limiting")
+            else:
+                print(f"  {len(urls)} after limit")
 
-    s, k, f = scrape_url_list(
-        session=session,
-        urls=urls,
-        out_dir=args.out,
-        delay=args.delay,
-        overwrite=args.overwrite,
-        category=None,
-        clean=args.clean,
-        cache_dir=args.cache_dir,
-    )
+        if args.list_only:
+            for u in urls:
+                print(u)
+            return
+
+        if tui.active:
+            tui.start_batch(
+                "Sitemap scrape",
+                f"{len(urls)} pages -> {args.out}",
+                len(urls),
+                mode="sitemap",
+                output_path=args.out,
+            )
+
+        s, k, f = scrape_url_list(
+            session=session,
+            urls=urls,
+            out_dir=args.out,
+            delay=args.delay,
+            overwrite=args.overwrite,
+            category=None,
+            clean=args.clean,
+            cache_dir=args.cache_dir,
+            download_images=args.download_images,
+            asset_root=args.out / "assets",
+            tui=tui,
+        )
+        if tui.active:
+            tui.update_stage("summarizing", str(args.out))
     print(f"\nDone. saved={s} skipped={k} failed={f}")
+    print_markdown_corpus_stats(args.out)
 
 
 if __name__ == "__main__":

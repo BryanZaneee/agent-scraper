@@ -82,6 +82,43 @@ preserving their visible text; strips footer navigation tables and sidebar leak
 links; promotes useful image alt text into table labels; normalizes repeated
 game-name headings; and drops placeholder sections such as `N/A` notes.
 
+Every scrape run ends with a token summary for the final Markdown collection:
+Markdown file count, bytes, words, estimated tokens, and the largest files. The
+token estimate is intentionally stable and dependency-free (`~4 chars/token`),
+so you can compare different scrape versions and category collections over time.
+
+Interactive terminal scrapes render a structured dashboard with weather effects
+inspired by the sibling `weathr` app: drifting clouds, rain, splashes, and rare
+lightning. The dashboard shows the active mode, current stage, output path,
+page progress, current URL, saved/skipped/failed counts, elapsed time, and
+recent page results. It automatically falls back to plain line-by-line logs
+when stdout is redirected, when the terminal is too small, or when you pass
+`--no-tui`.
+
+TUI controls are intentionally visual-only: `?` or `h` toggles help, `p`
+pauses/resumes the weather effects while scraping continues, `q` leaves the TUI
+and continues the scrape with plain logs, and `Ctrl-C` still cancels the scrape.
+
+### Scrape maps or other page images
+
+By default, the scraper stays text-only. Add `--download-images` when you want
+meaningful article images downloaded for AI workflows:
+
+```bash
+.venv/bin/python scrape.py \
+  --base https://darksouls.wiki.fextralife.com \
+  --category Maps \
+  --download-images
+```
+
+This keeps stat/table icons as text labels, but downloads real content images
+from the page into `output/assets/<page-slug>/` and writes relative image
+references into the Markdown, such as:
+
+```md
+![Northern Undead Asylum](../assets/Maps/Northern_AsylumMapV1.jpg)
+```
+
 ### Or scrape everything (sitemap mode)
 
 If you want every page in the wiki, drop `--category`:
@@ -92,6 +129,17 @@ If you want every page in the wiki, drop `--category`:
 
 This reads `/sitemap.xml` and saves every page into a single flat folder.
 Optionally narrow with `--filter '<regex>'`.
+
+### Compare token size for an existing collection
+
+Use `--stats-only` to inspect an existing output folder without fetching pages:
+
+```bash
+.venv/bin/python scrape.py --out output --stats-only
+```
+
+This is useful after cleanup iterations or when comparing category-specific
+collections for an AI agent knowledge base.
 
 ## Iterating on cleanup
 
@@ -142,7 +190,10 @@ simple title/source header and no YAML frontmatter.
 | `--delay`      | `1.0`                                   | seconds between requests                 |
 | `--overwrite`  | off                                     | re-download files that already exist     |
 | `--list-only`  | off                                     | print URLs only, don't download anything |
+| `--stats-only` | off                                     | only count existing Markdown under `--out` |
 | `--cache-dir`  | none                                    | cache raw HTML and replay from disk      |
+| `--download-images` | off                                | download meaningful article images in clean mode |
+| `--no-tui`     | off                                     | disable animated rain progress UI        |
 | `--no-clean`   | off                                     | skip cleanup/YAML frontmatter pass       |
 
 Category names with spaces use the wiki's URL form: `Ashes+of+War`,
@@ -156,12 +207,17 @@ Category names with spaces use the wiki's URL form: `Ashes+of+War`,
 3. **Fetch or replay** the raw HTML, optionally using `--cache-dir`.
 4. **Extract** only `<div id="wiki-content-block">` (the article body).
 5. **Clean** Fextralife noise: expand rowspans, preserve useful image alt text,
-   drop banner/footer/sidebar clutter, unwrap inline links, collapse empty table
-   columns, normalize headings, and remove placeholder sections.
+   optionally download content images, drop banner/footer/sidebar clutter,
+   unwrap inline links, collapse empty table columns, normalize headings, and
+   remove placeholder sections.
 6. **Extract frontmatter** from the first page-owned stat table when possible.
 7. **Convert** HTML to Markdown via `markdownify`.
 8. **Save** as `<slug>.md` with YAML frontmatter in clean mode.
-9. **Politeness:** 1s default delay, retry/backoff, skip files that
+9. **Render progress** through the optional interactive dashboard TUI when
+   stdout is a real terminal; otherwise preserve plain logs.
+10. **Summarize tokens** for the final Markdown collection using a stable
+   `~4 chars/token` estimate.
+11. **Politeness:** 1s default delay, retry/backoff, skip files that
    already exist (so you can interrupt and resume safely).
 
 ## Tests

@@ -1,9 +1,10 @@
 # Easy Scrape
 
-A flexible wiki scraper that converts web content into clean Markdown files.
-Currently supports [Fextralife](https://fextralife.com) wiki subdomains, with
-extensibility for other sites. Reads only the article body, strips images and
-scripts, rewrites internal links to absolute URLs, and writes one `.md` per page.
+A flexible wiki scraper that converts web content into clean, AI-friendly
+Markdown files. Currently supports [Fextralife](https://fextralife.com) wiki
+subdomains, with extensibility for other sites. Reads only the article body,
+normalizes noisy Fextralife markup, extracts useful stats into YAML
+frontmatter, and writes one `.md` per page.
 
 Tested on Dark Souls, Elden Ring, and Bloodborne — works on any wiki on
 the `*.wiki.fextralife.com` infrastructure.
@@ -12,7 +13,7 @@ the `*.wiki.fextralife.com` infrastructure.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install requests beautifulsoup4 markdownify lxml
+.venv/bin/pip install -r requirements.txt
 ```
 
 ## Pick your source
@@ -75,6 +76,12 @@ output/
 └── Bosses/
 ```
 
+Clean-mode output is the default. It adds YAML frontmatter with the page title,
+source URL, category, and best-effort table stats; removes inline links while
+preserving their visible text; strips footer navigation tables and sidebar leak
+links; promotes useful image alt text into table labels; normalizes repeated
+game-name headings; and drops placeholder sections such as `N/A` notes.
+
 ### Or scrape everything (sitemap mode)
 
 If you want every page in the wiki, drop `--category`:
@@ -85,6 +92,23 @@ If you want every page in the wiki, drop `--category`:
 
 This reads `/sitemap.xml` and saves every page into a single flat folder.
 Optionally narrow with `--filter '<regex>'`.
+
+## Iterating on cleanup
+
+Use `--cache-dir` while improving cleanup rules or testing a scrape shape. The
+first run stores raw HTML; later runs replay from disk and avoid refetching the
+same URLs.
+
+```bash
+.venv/bin/python scrape.py \
+  --base https://darksouls.wiki.fextralife.com \
+  --category Bosses \
+  --cache-dir .cache/html \
+  --overwrite
+```
+
+Use `--no-clean` when you need the older raw-ish markdownify output with a
+simple title/source header and no YAML frontmatter.
 
 ## Worked example: Elden Ring
 
@@ -118,6 +142,8 @@ Optionally narrow with `--filter '<regex>'`.
 | `--delay`      | `1.0`                                   | seconds between requests                 |
 | `--overwrite`  | off                                     | re-download files that already exist     |
 | `--list-only`  | off                                     | print URLs only, don't download anything |
+| `--cache-dir`  | none                                    | cache raw HTML and replay from disk      |
+| `--no-clean`   | off                                     | skip cleanup/YAML frontmatter pass       |
 
 Category names with spaces use the wiki's URL form: `Ashes+of+War`,
 `Boss+Souls`, etc. Use the names exactly as shown by `--discover`.
@@ -127,13 +153,25 @@ Category names with spaces use the wiki's URL form: `Ashes+of+War`,
 1. **Choose URL source** — `/sitemap.xml` for the whole wiki, or a hub
    page (e.g. `/Weapons`) plus its in-content links for category mode.
 2. **Fetch the page** with browser-like headers; auto-retry on 429/5xx.
-3. **Extract** only `<div id="wiki-content-block">` (the article body).
-4. **Strip** `<img>`, `<script>`, `<style>`, `<noscript>`, `<iframe>`.
-   Rewrite all `<a href>` to absolute URLs.
-5. **Convert** HTML to Markdown via `markdownify`.
-6. **Save** as `<slug>.md` with title and source URL header.
-7. **Politeness:** 1s default delay, retry/backoff, skip files that
+3. **Fetch or replay** the raw HTML, optionally using `--cache-dir`.
+4. **Extract** only `<div id="wiki-content-block">` (the article body).
+5. **Clean** Fextralife noise: expand rowspans, preserve useful image alt text,
+   drop banner/footer/sidebar clutter, unwrap inline links, collapse empty table
+   columns, normalize headings, and remove placeholder sections.
+6. **Extract frontmatter** from the first page-owned stat table when possible.
+7. **Convert** HTML to Markdown via `markdownify`.
+8. **Save** as `<slug>.md` with YAML frontmatter in clean mode.
+9. **Politeness:** 1s default delay, retry/backoff, skip files that
    already exist (so you can interrupt and resume safely).
+
+## Tests
+
+Fixture-based regression tests cover the cleanup behavior for representative
+Dark Souls pages:
+
+```bash
+.venv/bin/pytest
+```
 
 ## Quirks to know
 
@@ -141,8 +179,8 @@ Category names with spaces use the wiki's URL form: `Ashes+of+War`,
   individual pages. For example, on Dark Souls 1, `/Magic` links to
   `Pyromancies`, `Sorceries`, `Miracles` instead of listing spells
   directly. Use `--list-only` to spot this, then point at the leaf hubs.
-- Hub pages include some "noise" links (related categories, helper
-  pages). The bulk of what you get is the actual content; you can prune
-  the few extras manually.
+- Hub pages can still include some "noise" links (related categories, helper
+  pages). Clean mode removes the common sidebar/footer patterns, but use
+  `--list-only` before large runs when a category may be a meta-index.
 - The `#wiki-content-block` selector is shared across all Fextralife
   wikis, so the scraper itself doesn't need per-wiki tweaks.

@@ -1,11 +1,14 @@
 """Scrape wikis and web content to Markdown files.
 
 Currently optimized for Fextralife wikis (Dark Souls, Elden Ring, Bloodborne,
-Sekiro, etc.). Extensible for other sites. Pick a source with --base, then
-choose a mode:
+Sekiro, etc.). Extensible for other sites. Launch with no arguments for an
+interactive category picker, or pass flags for scriptable modes:
 
-- Sitemap mode (default): reads /sitemap.xml and scrapes every page into
-  a flat output directory.
+- Interactive mode (no args or --interactive): choose the default Dark Souls
+  wiki or enter a base URL, discover categories, multi-select categories, then
+  scrape them.
+- Sitemap mode (explicit flags without --category/--discover): reads
+  /sitemap.xml and scrapes every page into a flat output directory.
 - Category mode (--category Weapons --category Armor ...): fetches each
   category hub page (e.g. /Weapons), extracts member links, and saves
   each category into its own subfolder.
@@ -54,6 +57,8 @@ BROWSER_HEADERS = {
     "Accept-Encoding": "identity",
 }
 
+DEFAULT_BASE_URL = "https://darksouls.wiki.fextralife.com"
+DEFAULT_OUTPUT_DIR = Path.home() / "Desktop" / "easy_scrape_output"
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 CONTENT_SELECTOR = "#wiki-content-block"
 SIDEBAR_SELECTORS = (".wiki-menu-2-left", ".sidebar-nav")
@@ -68,6 +73,7 @@ TUI_MIN_WIDTH = 60
 TUI_MIN_HEIGHT = 18
 MAX_RAIN_SPLASHES = 100
 MAX_RECENT_EVENTS = 4
+INTERACTIVE_KEY_POLL_SECONDS = 0.08
 
 ANSI_RESET = "\x1b[0m"
 ANSI_CLEAR = "\x1b[2J"
@@ -76,6 +82,8 @@ ANSI_HIDE_CURSOR = "\x1b[?25l"
 ANSI_SHOW_CURSOR = "\x1b[?25h"
 ANSI_ALT_SCREEN = "\x1b[?1049h"
 ANSI_MAIN_SCREEN = "\x1b[?1049l"
+ANSI_ENABLE_MOUSE = "\x1b[?1000h\x1b[?1006h"
+ANSI_DISABLE_MOUSE = "\x1b[?1006l\x1b[?1000l"
 
 ANSI_COLORS = {
     "reset": "\x1b[0m",
@@ -88,6 +96,25 @@ ANSI_COLORS = {
     "red": "\x1b[31m",
     "magenta": "\x1b[35m",
 }
+
+EASY_SCRAPE_BANNER = [
+    "  ___  __ _ ___ _   _ ___  ___ _ __ __ _ _ __   ___",
+    " / _ \\/ _` / __| | | / __|/ __| '__/ _` | '_ \\ / _ \\",
+    "|  __/ (_| \\__ \\ |_| \\__ \\ (__| | | (_| | |_) |  __/",
+    " \\___|\\__,_|___/\\__, |___/\\___|_|  \\__,_| .__/ \\___|",
+    "                |___/                   |_|",
+]
+
+BONFIRE_ASCII = [
+    ("        /\\", "yellow"),
+    ("        ||", "yellow"),
+    ("     .-'||'-.", "dim"),
+    ("        ||", "yellow"),
+    ("     \\  ||  /", "red"),
+    ("    .-\\ || /-.", "yellow"),
+    ("   /__/####\\__\\", "red"),
+    ("     _/====\\_", "dim"),
+]
 
 # Paths inside category hub pages that are not member content (sidebar nav,
 # meta-pages, etc.). Member URLs containing any of these are dropped.
@@ -974,6 +1001,11 @@ def print_markdown_corpus_stats(root: Path, *, top_n: int = 5) -> None:
         f"{format_int(stats.estimated_tokens)} "
         f"(~{TOKEN_CHARS_PER_TOKEN} chars/token)"
     )
+    print(
+        "  Final report: "
+        f"{format_int(stats.file_count)} files, "
+        f"{format_int(stats.estimated_tokens)} estimated tokens"
+    )
 
     if not stats.files:
         return
@@ -1426,6 +1458,787 @@ def url_host(url: str) -> str:
     return urlparse(url).netloc or url
 
 
+def normalize_base_url(raw_url: str) -> str:
+    """Normalize user-entered base URLs for interactive mode."""
+    value = raw_url.strip()
+    if not value:
+        return DEFAULT_BASE_URL
+    has_scheme = re.match(r"^[a-z][a-z0-9+.-]*://", value, flags=re.IGNORECASE)
+    has_http_scheme = re.match(r"^https?://", value, flags=re.IGNORECASE)
+    if has_scheme and not has_http_scheme:
+        raise ValueError("Enter a valid http(s) URL.")
+    if not has_http_scheme:
+        value = f"https://{value}"
+
+    parsed = urlparse(value)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        raise ValueError("Enter a valid http(s) URL.")
+
+    normalized = parsed._replace(
+        scheme=parsed.scheme.lower(),
+        netloc=parsed.netloc.lower(),
+        path=parsed.path.rstrip("/"),
+        params="",
+        query="",
+        fragment="",
+    ).geturl()
+    return normalized.rstrip("/")
+
+
+def normalize_output_dir(raw_path: str, default_path: Path) -> Path:
+    """Normalize a user-entered output directory without creating it yet."""
+    value = raw_path.strip()
+    if not value:
+        path = default_path
+    else:
+        path = Path(os.path.expandvars(value)).expanduser()
+    if path.exists() and not path.is_dir():
+        raise ValueError("Output path exists but is not a directory.")
+    return path
+
+
+def normalize_existing_output_dir(raw_path: str, current_dir: Path) -> Path:
+    """Return an existing output directory entered from the folder browser."""
+    value = raw_path.strip()
+    if not value:
+        path = current_dir
+    else:
+        path = Path(os.path.expandvars(value)).expanduser()
+        if not path.is_absolute():
+            path = current_dir / path
+    if not path.exists():
+        raise ValueError("Path does not exist. Use n to create a new folder.")
+    if not path.is_dir():
+        raise ValueError("Output path exists but is not a directory.")
+    return path
+
+
+def normalize_new_output_dir(folder_name: str, current_dir: Path) -> Path:
+    """Return a child output folder path without creating it yet."""
+    name = folder_name.strip()
+    if not name:
+        raise ValueError("Enter a folder name.")
+    candidate = Path(name)
+    if candidate.is_absolute() or candidate.name != name or name in (".", ".."):
+        raise ValueError("Enter a folder name, not a path.")
+    path = current_dir / name
+    if path.exists() and not path.is_dir():
+        raise ValueError("Output path exists but is not a directory.")
+    return path
+
+
+def display_path(path: Path) -> str:
+    """Return a compact path label for terminal screens and help text."""
+    expanded = path.expanduser()
+    try:
+        home = Path.home()
+        relative = expanded.relative_to(home)
+        return f"~/{relative}" if str(relative) != "." else "~"
+    except ValueError:
+        return str(path)
+
+
+def output_browser_start_dir() -> Path:
+    """Start interactive output browsing on Desktop, falling back to home."""
+    desktop = Path.home() / "Desktop"
+    if desktop.is_dir():
+        return desktop
+    return Path.home()
+
+
+def list_browsable_dirs(path: Path) -> list[Path]:
+    """Return visible child directories for the output folder browser."""
+    try:
+        children = [
+            child
+            for child in path.iterdir()
+            if child.is_dir() and not child.name.startswith(".")
+        ]
+    except OSError:
+        return []
+    return sorted(children, key=lambda child: child.name.casefold())
+
+
+@dataclass
+class FolderBrowserState:
+    """State machine for the interactive output folder browser."""
+
+    default_output: Path
+    current_dir: Path
+    folders: list[Path] = field(default_factory=list)
+    cursor: int = 0
+    submitted: Path | None = None
+    cancelled: bool = False
+    message: str = ""
+
+    @property
+    def row_count(self) -> int:
+        return 2 + len(self.folders)
+
+    def refresh(self) -> None:
+        self.folders = list_browsable_dirs(self.current_dir)
+        self.cursor = max(0, min(self.cursor, self.row_count - 1))
+
+    def handle_key(self, key: str) -> None:
+        if key in ("q", "Q", "escape"):
+            self.cancelled = True
+            return
+        if key in ("up", "k", "K"):
+            self.cursor = max(0, self.cursor - 1)
+        elif key in ("down", "j", "J"):
+            self.cursor = min(self.row_count - 1, self.cursor + 1)
+        elif key in ("backspace", "h", "H"):
+            self.go_parent()
+        elif key == "~":
+            self.go_home()
+        elif key in ("d", "D"):
+            self.go_desktop()
+        elif key == "enter":
+            self.submit_or_open()
+
+    def submit_or_open(self) -> None:
+        if self.cursor == 0:
+            self.submitted = self.default_output
+            return
+        if self.cursor == 1:
+            self.submitted = self.current_dir
+            return
+        folder = self.folders[self.cursor - 2]
+        self.current_dir = folder
+        self.cursor = 1
+        self.message = ""
+        self.refresh()
+
+    def go_parent(self) -> None:
+        parent = self.current_dir.parent
+        if parent != self.current_dir and parent.is_dir():
+            self.current_dir = parent
+            self.cursor = 1
+            self.message = ""
+            self.refresh()
+
+    def go_home(self) -> None:
+        self.current_dir = Path.home()
+        self.cursor = 1
+        self.message = ""
+        self.refresh()
+
+    def go_desktop(self) -> None:
+        self.current_dir = output_browser_start_dir()
+        self.cursor = 1
+        self.message = ""
+        self.refresh()
+
+    def submit_direct_path(self, raw_path: str) -> None:
+        self.submitted = normalize_existing_output_dir(raw_path, self.current_dir)
+
+    def submit_new_folder(self, folder_name: str) -> None:
+        self.submitted = normalize_new_output_dir(folder_name, self.current_dir)
+
+
+@dataclass
+class CategoryPickerState:
+    """State machine for the interactive multi-select category picker."""
+
+    categories: list[str]
+    cursor: int = 0
+    selected: set[str] = field(default_factory=set)
+    submitted: bool = False
+    cancelled: bool = False
+    message: str = ""
+
+    def __post_init__(self) -> None:
+        if self.categories:
+            self.cursor = max(0, min(self.cursor, len(self.categories) - 1))
+        else:
+            self.cursor = 0
+
+    def selected_categories(self) -> list[str]:
+        return [name for name in self.categories if name in self.selected]
+
+    def handle_key(self, key: str) -> None:
+        if key in ("q", "Q", "escape"):
+            self.cancelled = True
+            return
+        if not self.categories:
+            return
+
+        if key in ("up", "k", "K"):
+            self.cursor = max(0, self.cursor - 1)
+        elif key in ("down", "j", "J"):
+            self.cursor = min(len(self.categories) - 1, self.cursor + 1)
+        elif key in (" ", "space"):
+            current = self.categories[self.cursor]
+            if current in self.selected:
+                self.selected.remove(current)
+            else:
+                self.selected.add(current)
+            self.message = ""
+        elif key in ("a", "A"):
+            self.selected = set(self.categories)
+            self.message = "All categories selected."
+        elif key in ("n", "N"):
+            self.selected.clear()
+            self.message = "Selection cleared."
+        elif key in ("enter", "\n", "\r"):
+            if self.selected:
+                self.submitted = True
+            else:
+                self.message = "Select at least one category before continuing."
+
+
+class InteractiveScrapeTui:
+    """Blocking pre-scrape terminal UI for picking source and categories."""
+
+    def __init__(
+        self,
+        *,
+        stream: TextIO | None = None,
+        input_stream: TextIO | None = None,
+    ) -> None:
+        self.stream = stream or sys.stdout
+        self.input_stream = input_stream or sys.stdin
+        self._stdin_fd: int | None = None
+        self._stdin_attrs = None
+        self._entered = False
+        self._rain = TerminalRainSystem()
+        self._clouds = TerminalCloudSystem()
+
+    def is_available(self) -> bool:
+        return bool(self.stream.isatty() and self.input_stream.isatty())
+
+    def __enter__(self) -> "InteractiveScrapeTui":
+        self._enable_input()
+        self._write(
+            ANSI_ALT_SCREEN
+            + ANSI_ENABLE_MOUSE
+            + ANSI_HIDE_CURSOR
+            + ANSI_CLEAR
+            + ANSI_HOME
+        )
+        self._entered = True
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self._restore_input()
+        if self._entered:
+            self._write(
+                ANSI_RESET
+                + ANSI_CLEAR
+                + ANSI_HOME
+                + ANSI_DISABLE_MOUSE
+                + ANSI_SHOW_CURSOR
+                + ANSI_MAIN_SCREEN
+            )
+        self._entered = False
+
+    def _enable_input(self) -> None:
+        self._stdin_fd = self.input_stream.fileno()
+        self._stdin_attrs = termios.tcgetattr(self._stdin_fd)
+        tty.setcbreak(self._stdin_fd)
+
+    def _restore_input(self) -> None:
+        if self._stdin_fd is None or self._stdin_attrs is None:
+            return
+        try:
+            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._stdin_attrs)
+        finally:
+            self._stdin_fd = None
+            self._stdin_attrs = None
+
+    def _write(self, text: str) -> None:
+        self.stream.write(text)
+        self.stream.flush()
+
+    def _read_char(self, timeout: float | None = None) -> str | None:
+        if timeout is not None:
+            target = self._stdin_fd if self._stdin_fd is not None else self.input_stream
+            readable, _, _ = select.select([target], [], [], timeout)
+            if not readable:
+                return None
+
+        if self._stdin_fd is not None:
+            data = os.read(self._stdin_fd, 1)
+            if not data:
+                return None
+            return data.decode(errors="ignore")
+
+        ch = self.input_stream.read(1)
+        return ch or None
+
+    def _read_key(self, timeout: float | None = None) -> str | None:
+        ch = self._read_char(timeout)
+        if ch is None:
+            return None
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch == "\x1b":
+            return key_name_from_sequence(self._read_escape_sequence())
+        if ch in ("\n", "\r"):
+            return "enter"
+        if ch in ("\x7f", "\b"):
+            return "backspace"
+        if ch == " ":
+            return "space"
+        return ch
+
+    def _read_escape_sequence(self) -> str:
+        sequence = "\x1b"
+        introducer = self._read_char(INTERACTIVE_KEY_POLL_SECONDS)
+        if introducer is None:
+            return sequence
+
+        sequence += introducer
+        if introducer == "[":
+            for _ in range(32):
+                next_ch = self._read_char(INTERACTIVE_KEY_POLL_SECONDS)
+                if next_ch is None:
+                    break
+                sequence += next_ch
+                if sequence == "\x1b[M":
+                    for _ in range(3):
+                        mouse_ch = self._read_char(INTERACTIVE_KEY_POLL_SECONDS)
+                        if mouse_ch is None:
+                            break
+                        sequence += mouse_ch
+                    break
+                if "@" <= next_ch <= "~":
+                    break
+        elif introducer == "O":
+            next_ch = self._read_char(INTERACTIVE_KEY_POLL_SECONDS)
+            if next_ch is not None:
+                sequence += next_ch
+
+        return sequence
+
+    def _render(self, title: str, body: list[str], footer: str = "") -> None:
+        size = shutil.get_terminal_size((80, 24))
+        width = max(40, size.columns)
+        height = max(12, size.lines)
+        frame = self._draw_frame(width, height, title, body, footer)
+        self._write(ANSI_HOME + frame)
+
+    def _banner_lines(self, width: int) -> list[str]:
+        if width < 64:
+            return ["easyScrape"]
+        return EASY_SCRAPE_BANNER
+
+    def _bonfire_layout(
+        self, panel_left: int, panel_top: int, panel_width: int, panel_height: int
+    ) -> tuple[int, int] | None:
+        art_width = max(len(line) for line, _color in BONFIRE_ASCII)
+        art_height = len(BONFIRE_ASCII)
+        if panel_width < art_width + 36 or panel_height < art_height + 3:
+            return None
+
+        art_x = panel_left + panel_width - art_width - 3
+        art_y = panel_top + panel_height - art_height - 2
+        return art_x, art_y
+
+    def _draw_bonfire(self, canvas: TerminalCanvas, x: int, y: int) -> None:
+        for offset, (line, color) in enumerate(BONFIRE_ASCII):
+            canvas.text(x, y + offset, line, color)
+
+    def _draw_frame(
+        self,
+        width: int,
+        height: int,
+        title: str,
+        body: list[str],
+        footer: str = "",
+    ) -> str:
+        canvas = TerminalCanvas(width, height)
+        banner = self._banner_lines(width)
+        banner_top = 1
+        panel_top = min(height - 8, banner_top + len(banner) + 2)
+        panel_top = max(4, panel_top)
+        panel_height = max(7, height - panel_top - 2)
+        panel_width = min(max(40, width - 8), 100)
+        panel_left = max(2, (width - panel_width) // 2)
+        panel_right = panel_left + panel_width - 1
+        bonfire_layout = self._bonfire_layout(
+            panel_left, panel_top, panel_width, panel_height
+        )
+
+        self._clouds.update(width, height, speed=0.8)
+        self._rain.update(
+            width,
+            height,
+            (panel_left, panel_right, panel_top),
+            speed=1.1,
+        )
+        self._clouds.render(canvas)
+        self._rain.render_drops(canvas)
+
+        for offset, line in enumerate(banner):
+            color = "cyan" if offset % 2 == 0 else "white"
+            canvas.text(
+                max(0, (width - len(line)) // 2),
+                banner_top + offset,
+                line,
+                color,
+            )
+
+        canvas.fill_rect(
+            panel_left + 1,
+            panel_top + 1,
+            panel_width - 2,
+            panel_height - 2,
+        )
+        canvas.box(panel_left, panel_top, panel_width, panel_height, "cyan")
+        title_label = f" {title} "
+        canvas.text(
+            panel_left + max(2, (panel_width - len(title_label)) // 2),
+            panel_top,
+            title_label,
+            "white",
+        )
+
+        inner_x = panel_left + 3
+        inner_width = max(1, panel_width - 6)
+        max_body_lines = max(1, panel_height - 4)
+        for offset, line in enumerate(body[:max_body_lines]):
+            line_y = panel_top + 2 + offset
+            line_width = inner_width
+            if bonfire_layout is not None:
+                art_x, art_y = bonfire_layout
+                if art_y <= line_y < art_y + len(BONFIRE_ASCII):
+                    line_width = max(1, art_x - inner_x - 2)
+            canvas.text(
+                inner_x,
+                line_y,
+                fit_text(line, line_width),
+                "white" if line.startswith(">") else "dim",
+            )
+
+        if bonfire_layout is not None:
+            self._draw_bonfire(canvas, *bonfire_layout)
+
+        self._rain.render_splashes(canvas)
+        footer_text = footer or "up/down or j/k move | enter choose | q quit"
+        canvas.text(2, height - 1, fit_text(footer_text, width - 4), "dim")
+        return canvas.render()
+
+    def choose_source(self, default_base_url: str) -> str | None:
+        default_label = (
+            "Dark Souls Fextra"
+            if default_base_url == DEFAULT_BASE_URL
+            else "Configured source"
+        )
+        options = [
+            ("default", f"{default_label} ({default_base_url})"),
+            ("custom", "Enter URL"),
+        ]
+        selected = self._run_menu(
+            "Choose a source",
+            options,
+            footer="up/down or j/k move | enter choose | q quit",
+        )
+        return selected
+
+    def _run_menu(
+        self,
+        title: str,
+        options: list[tuple[str, str]],
+        *,
+        footer: str,
+    ) -> str | None:
+        cursor = 0
+        while True:
+            body = []
+            for idx, (_value, label) in enumerate(options):
+                prefix = ">" if idx == cursor else " "
+                body.append(f"{prefix} {label}")
+            self._render(title, body, footer)
+
+            key = self._read_key(TUI_FRAME_SECONDS)
+            if key is None:
+                continue
+            if key in ("q", "Q", "escape"):
+                return None
+            if key in ("up", "k", "K"):
+                cursor = max(0, cursor - 1)
+            elif key in ("down", "j", "J"):
+                cursor = min(len(options) - 1, cursor + 1)
+            elif key == "enter":
+                return options[cursor][0]
+
+    def prompt_url(self, default_base_url: str) -> str | None:
+        value = ""
+        error = ""
+        while True:
+            body = [
+                "Enter a site or wiki base URL.",
+                "",
+                f"Default: {default_base_url}",
+                "",
+                f"URL: {value}",
+            ]
+            if error:
+                body.extend(["", error])
+            self._render(
+                "Custom source URL",
+                body,
+                "enter continue | esc cancel | backspace edit",
+            )
+
+            key = self._read_key(TUI_FRAME_SECONDS)
+            if key is None:
+                continue
+            if key == "escape":
+                return None
+            if key == "enter":
+                try:
+                    return normalize_base_url(value or default_base_url)
+                except ValueError as exc:
+                    error = str(exc)
+            elif key == "backspace":
+                value = value[:-1]
+                error = ""
+            elif len(key) == 1 and key.isprintable():
+                value += key
+                error = ""
+
+    def choose_output_path(self, default_output_path: Path) -> Path | None:
+        state = FolderBrowserState(
+            default_output=default_output_path,
+            current_dir=output_browser_start_dir(),
+        )
+        state.refresh()
+        while state.submitted is None and not state.cancelled:
+            self._draw_output_folder_browser(state)
+            key = self._read_key(TUI_FRAME_SECONDS)
+            if key is None:
+                continue
+            if key == "/":
+                path = self.prompt_direct_output_path(state.current_dir)
+                if path is not None:
+                    state.submitted = path
+            elif key in ("n", "N"):
+                path = self.prompt_new_output_folder(state.current_dir)
+                if path is not None:
+                    state.submitted = path
+            else:
+                try:
+                    state.handle_key(key)
+                except ValueError as exc:
+                    state.message = str(exc)
+        if state.cancelled:
+            return None
+        return state.submitted
+
+    def prompt_direct_output_path(
+        self, current_dir: Path, initial_error: str = ""
+    ) -> Path | None:
+        value = ""
+        error = initial_error
+        while True:
+            body = [
+                "Enter an existing output folder.",
+                "",
+                f"Current: {display_path(current_dir)}",
+                "",
+                f"Path: {value}",
+            ]
+            if error:
+                body.extend(["", error])
+            self._render(
+                "Direct output path",
+                body,
+                "enter continue | esc cancel | backspace edit",
+            )
+
+            key = self._read_key(TUI_FRAME_SECONDS)
+            if key is None:
+                continue
+            if key == "escape":
+                return None
+            if key == "enter":
+                try:
+                    return normalize_existing_output_dir(value, current_dir)
+                except ValueError as exc:
+                    error = str(exc)
+            elif key == "backspace":
+                value = value[:-1]
+                error = ""
+            elif key == "space":
+                value += " "
+                error = ""
+            elif len(key) == 1 and key.isprintable():
+                value += key
+                error = ""
+
+    def prompt_new_output_folder(self, current_dir: Path) -> Path | None:
+        value = ""
+        error = ""
+        while True:
+            body = [
+                "Name a new output folder.",
+                "",
+                f"Inside: {display_path(current_dir)}",
+                "",
+                f"Folder: {value}",
+            ]
+            if error:
+                body.extend(["", error])
+            self._render(
+                "New output folder",
+                body,
+                "enter choose | esc cancel | backspace edit",
+            )
+
+            key = self._read_key(TUI_FRAME_SECONDS)
+            if key is None:
+                continue
+            if key == "escape":
+                return None
+            if key == "enter":
+                try:
+                    return normalize_new_output_dir(value, current_dir)
+                except ValueError as exc:
+                    error = str(exc)
+            elif key == "backspace":
+                value = value[:-1]
+                error = ""
+            elif key == "space":
+                value += " "
+                error = ""
+            elif len(key) == 1 and key.isprintable():
+                value += key
+                error = ""
+
+    def _draw_output_folder_browser(self, state: FolderBrowserState) -> None:
+        size = shutil.get_terminal_size((80, 24))
+        rows: list[tuple[str, str]] = [
+            ("default", f"Use {display_path(state.default_output)}"),
+            ("current", f"Use current folder ({display_path(state.current_dir)})"),
+        ]
+        rows.extend(("folder", folder.name) for folder in state.folders)
+
+        visible_count = max(5, size.lines - 12)
+        half = visible_count // 2
+        start = max(0, min(state.cursor - half, len(rows) - visible_count))
+        end = min(len(rows), start + visible_count)
+
+        body = [
+            f"Browsing: {display_path(state.current_dir)}",
+            f"Folders: {len(state.folders)}",
+            "",
+        ]
+        for idx in range(start, end):
+            kind, label = rows[idx]
+            cursor = ">" if idx == state.cursor else " "
+            if kind == "folder":
+                label = f"[dir] {label}"
+            body.append(f"{cursor} {label}")
+        if not state.folders:
+            body.append("  No visible folders here.")
+        if state.message:
+            body.extend(["", state.message])
+
+        self._render(
+            "Choose output folder",
+            body,
+            "enter use/open | backspace parent | ~ home | d desktop | n new | / path | q quit",
+        )
+
+    def show_status(self, title: str, detail: str) -> None:
+        self._render(title, [detail, "", "Please wait..."])
+
+    def show_error(self, title: str, message: str) -> str | None:
+        while True:
+            self._render(
+                title,
+                [message, "", "Press enter to choose another source."],
+                "enter back | q quit",
+            )
+            key = self._read_key(TUI_FRAME_SECONDS)
+            if key is None:
+                continue
+            if key in ("q", "Q", "escape"):
+                return None
+            if key == "enter":
+                return "back"
+
+    def choose_no_category_fallback(self, base_url: str) -> str | None:
+        return self._run_menu(
+            "No categories found",
+            [
+                ("sitemap", f"Scrape site via sitemap ({base_url}/sitemap.xml)"),
+                ("single", f"Scrape this URL only ({base_url})"),
+                ("back", "Choose another source"),
+            ],
+            footer="up/down or j/k move | enter choose | q quit",
+        )
+
+    def choose_categories(
+        self, categories: list[str], *, base_url: str
+    ) -> list[str] | None:
+        state = CategoryPickerState(categories)
+        while not state.submitted and not state.cancelled:
+            self._draw_category_picker(state, base_url=base_url)
+            key = self._read_key(TUI_FRAME_SECONDS)
+            if key is not None:
+                state.handle_key(key)
+        if state.cancelled:
+            return None
+        return state.selected_categories()
+
+    def _draw_category_picker(
+        self, state: CategoryPickerState, *, base_url: str
+    ) -> None:
+        size = shutil.get_terminal_size((80, 24))
+        visible_count = max(5, size.lines - 10)
+        half = visible_count // 2
+        start = max(0, min(state.cursor - half, len(state.categories) - visible_count))
+        end = min(len(state.categories), start + visible_count)
+
+        body = [
+            f"Source: {base_url}",
+            f"Selected: {len(state.selected)} / {len(state.categories)}",
+            "",
+        ]
+        for idx in range(start, end):
+            name = state.categories[idx]
+            cursor = ">" if idx == state.cursor else " "
+            mark = "x" if name in state.selected else " "
+            body.append(f"{cursor} [{mark}] {name}")
+        if state.message:
+            body.extend(["", state.message])
+
+        self._render(
+            "Select categories",
+            body,
+            "space toggle | a all | n none | enter scrape | q quit",
+        )
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def key_name_from_sequence(sequence: str) -> str:
+    """Return a semantic key name for terminal escape sequences."""
+    if re.fullmatch(r"\x1b\[<[0-9;]+[mM]", sequence):
+        return "mouse"
+    if re.fullmatch(r"\x1b\[M...", sequence, flags=re.DOTALL):
+        return "mouse"
+    if re.fullmatch(r"\x1b(?:\[|O)[0-9;]*A", sequence):
+        return "up"
+    if re.fullmatch(r"\x1b(?:\[|O)[0-9;]*B", sequence):
+        return "down"
+    if re.fullmatch(r"\x1b(?:\[|O)[0-9;]*C", sequence):
+        return "right"
+    if re.fullmatch(r"\x1b(?:\[|O)[0-9;]*D", sequence):
+        return "left"
+    if sequence == "\x1b":
+        return "escape"
+    return "escape"
+
+
 class ScrapeRainTui:
     """Optional animated dashboard. Inert when not attached to a TTY."""
 
@@ -1480,7 +2293,11 @@ class ScrapeRainTui:
             self._enable_input_controls()
             with self._io_lock:
                 self.stream.write(
-                    ANSI_ALT_SCREEN + ANSI_HIDE_CURSOR + ANSI_CLEAR + ANSI_HOME
+                    ANSI_ALT_SCREEN
+                    + ANSI_ENABLE_MOUSE
+                    + ANSI_HIDE_CURSOR
+                    + ANSI_CLEAR
+                    + ANSI_HOME
                 )
                 self.stream.flush()
             self._entered = True
@@ -1511,6 +2328,7 @@ class ScrapeRainTui:
                     ANSI_RESET
                     + ANSI_CLEAR
                     + ANSI_HOME
+                    + ANSI_DISABLE_MOUSE
                     + ANSI_SHOW_CURSOR
                     + ANSI_MAIN_SCREEN
                 )
@@ -1556,6 +2374,7 @@ class ScrapeRainTui:
                     ANSI_RESET
                     + ANSI_CLEAR
                     + ANSI_HOME
+                    + ANSI_DISABLE_MOUSE
                     + ANSI_SHOW_CURSOR
                     + ANSI_MAIN_SCREEN
                 )
@@ -2101,14 +2920,14 @@ def scrape_url_list(
     return saved, skipped, failed
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
         "--base",
-        default="https://darksouls.wiki.fextralife.com",
+        default=DEFAULT_BASE_URL,
         help=(
             "Fextralife wiki subdomain base URL. Examples: "
             "https://darksouls.wiki.fextralife.com (default), "
@@ -2120,8 +2939,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out",
         type=Path,
-        default=Path("output"),
-        help="Output directory (default: output)",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Output directory (default: {display_path(DEFAULT_OUTPUT_DIR)})",
     )
     p.add_argument(
         "--category",
@@ -2169,6 +2988,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--interactive",
+        action="store_true",
+        help=(
+            "Open the interactive source/category picker before scraping. "
+            "With no arguments this is the default."
+        ),
+    )
+    p.add_argument(
         "--discover",
         action="store_true",
         help=(
@@ -2209,23 +3036,124 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.set_defaults(clean=True, tui=True)
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def dispatch_mode(args: argparse.Namespace, argv: list[str]) -> str:
+    """Return the top-level mode selected by argv without creating side effects."""
     if args.stats_only:
+        return "stats"
+    if args.interactive or not argv:
+        return "interactive"
+    if args.discover:
+        return "discover"
+    if args.category:
+        return "category"
+    return "sitemap"
+
+
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    args = parse_args(argv)
+    mode = dispatch_mode(args, argv)
+
+    if mode == "stats":
         print_markdown_corpus_stats(args.out)
         return
 
     session = make_session()
 
-    if args.discover:
+    if mode == "interactive":
+        run_interactive_mode(session, args)
+    elif mode == "discover":
         run_discover_mode(session, args)
-    elif args.category:
+    elif mode == "category":
         run_category_mode(session, args)
     else:
         run_sitemap_mode(session, args)
+
+
+def run_interactive_mode(
+    session: requests.Session,
+    args: argparse.Namespace,
+    *,
+    stream: TextIO | None = None,
+    input_stream: TextIO | None = None,
+) -> None:
+    tui = InteractiveScrapeTui(stream=stream, input_stream=input_stream)
+    if not tui.is_available():
+        print(
+            "Interactive mode requires a terminal for both stdin and stdout. "
+            "Pass --category, --discover, or another explicit mode for "
+            "scripted use.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    selected_categories: list[str] | None = None
+    fallback_mode: str | None = None
+    configured_base = normalize_base_url(args.base)
+    selected_base = configured_base
+    selected_output = args.out
+
+    with tui:
+        while selected_categories is None and fallback_mode is None:
+            source = tui.choose_source(configured_base)
+            if source is None:
+                return
+
+            if source == "custom":
+                custom_base = tui.prompt_url(configured_base)
+                if custom_base is None:
+                    continue
+                selected_base = custom_base
+            else:
+                selected_base = configured_base
+
+            tui.show_status("Discovering categories", selected_base)
+            try:
+                categories = discover_sidebar_categories(session, selected_base)
+            except requests.RequestException as exc:
+                action = tui.show_error(
+                    "Could not discover categories",
+                    f"{selected_base}: {exc}",
+                )
+                if action is None:
+                    return
+                continue
+
+            if not categories:
+                fallback = tui.choose_no_category_fallback(selected_base)
+                if fallback is None:
+                    return
+                if fallback == "back":
+                    continue
+                fallback_mode = fallback
+                continue
+
+            selected_categories = tui.choose_categories(
+                categories, base_url=selected_base
+            )
+            if selected_categories is None:
+                return
+
+        output_path = tui.choose_output_path(args.out)
+        if output_path is None:
+            return
+        selected_output = output_path
+
+    args.base = selected_base
+    args.out = selected_output
+    if fallback_mode == "sitemap":
+        run_sitemap_mode(session, args)
+        return
+    if fallback_mode == "single":
+        run_single_url_mode(session, args, selected_base)
+        return
+
+    args.category = selected_categories
+    run_category_mode(session, args)
 
 
 def run_discover_mode(session: requests.Session, args: argparse.Namespace) -> None:
@@ -2237,6 +3165,47 @@ def run_discover_mode(session: requests.Session, args: argparse.Namespace) -> No
     print(f"\n{len(names)} category candidates (pass any to --category):\n")
     for name in names:
         print(f"  {name}")
+
+
+def run_single_url_mode(
+    session: requests.Session,
+    args: argparse.Namespace,
+    url: str,
+) -> None:
+    if args.list_only:
+        print(url)
+        return
+
+    with ScrapeRainTui(enabled=args.tui) as tui:
+        if tui.active:
+            tui.start_batch(
+                "Single URL scrape",
+                f"1 page -> {args.out}",
+                1,
+                mode="single-url",
+                output_path=args.out,
+            )
+        else:
+            print(f"\n=== Single URL scrape: {url} -> {args.out} ===")
+
+        s, k, f = scrape_url_list(
+            session=session,
+            urls=[url],
+            out_dir=args.out,
+            delay=args.delay,
+            overwrite=args.overwrite,
+            category=None,
+            clean=args.clean,
+            cache_dir=args.cache_dir,
+            download_images=args.download_images,
+            asset_root=args.out / "assets",
+            tui=tui,
+        )
+        if tui.active:
+            tui.update_stage("summarizing", str(args.out))
+
+    print(f"\nDone. saved={s} skipped={k} failed={f}")
+    print_markdown_corpus_stats(args.out)
 
 
 def run_category_mode(session: requests.Session, args: argparse.Namespace) -> None:

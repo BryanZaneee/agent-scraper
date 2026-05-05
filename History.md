@@ -18,6 +18,187 @@ Format per entry:
 
 ---
 
+## 2026-05-05 — TUI output folder browser
+
+**Context:** The first interactive output step still required users to type a
+custom path if they did not want the default Desktop folder. The user wanted a
+cooler scraper-style folder selection flow that stays inside the terminal.
+
+**Decision:** Replace the two-choice output menu with a dependency-free folder
+browser in `InteractiveScrapeTui`. The browser starts on Desktop when
+available, falls back to home, keeps `~/Desktop/easy_scrape_output` as the
+first action, lets users choose the current folder, open child folders, jump to
+home/Desktop, type an existing path, or name a new child folder without creating
+it before the scrape pipeline runs.
+
+**Rationale:** A state-machine-backed browser gives users the feel of a real
+folder picker without adding a native dialog dependency or bypassing the
+existing `args.out` plumbing. Returning a plain `Path` keeps category, sitemap,
+single-URL, asset, dashboard, and stats behavior unchanged downstream.
+
+**Alternatives considered:** A native OS folder dialog was rejected because it
+would make the scraper less portable and harder to test in terminal-first
+contexts. Keeping only the custom path prompt was rejected because it is clumsy
+for users who want to browse to a destination.
+
+**Trade-offs:** The browser lists visible child directories only. Hidden
+folders and unusual paths remain reachable through the direct path entry.
+
+---
+
+## 2026-05-05 — Interactive output folder selection
+
+**Context:** The interactive TUI let users choose a source and categories, but
+the output location was still controlled only by `--out`. The requested flow is
+to confirm where files should go before the scraper starts writing.
+
+**Decision:** Add a pre-scrape output-folder chooser to `InteractiveScrapeTui`.
+The default output directory is now `~/Desktop/easy_scrape_output`; the TUI
+offers that location first and lets users enter a custom path. The chosen path
+is assigned back to `args.out` before category, sitemap fallback, or single-URL
+fallback scraping starts, so all existing output, asset, dashboard, and stats
+paths continue to use one source of truth.
+
+**Rationale:** Placing the prompt after target selection but before the scrape
+keeps the flow explicit without changing the scraping pipeline. Reusing `Path`
+objects and the existing `args.out` plumbing avoids a parallel output setting
+that future agents would have to keep in sync.
+
+**Alternatives considered:** Prompting for an output folder before category
+discovery was rejected because the user may back out or change sources first.
+Creating a separate interactive-only output setting was rejected because the
+downstream runners already use `args.out` consistently.
+
+**Trade-offs:** Scripted modes also inherit the new desktop default when
+`--out` is omitted. Users who want the old repo-local `output/` folder can pass
+`--out output`.
+
+---
+
+## 2026-05-05 — Picker bonfire ASCII art
+
+**Context:** The interactive source/category menu now has a branded animated
+banner and rain layer, and the user wanted an ASCII version of a bonfire image
+placed in the bottom-right of the menu.
+
+**Decision:** Add a small ASCII-only bonfire/sword motif to the
+`InteractiveScrapeTui` frame renderer. The art is anchored inside the lower
+right of the picker panel and the body text dynamically shortens on rows where
+the bonfire occupies space, so menu content does not paint through the art.
+
+**Rationale:** Keeping the bonfire in the existing terminal canvas preserves
+the project's dependency-free TUI architecture and lets the same frame renderer
+handle source selection, custom URL prompts, status screens, errors, and
+category selection consistently.
+
+**Alternatives considered:** A larger full-screen illustration was rejected
+because it would compete with category lists and URL prompts. Adding image or
+Unicode rendering was rejected because the requested asset was ASCII and the
+TUI already uses plain terminal cells.
+
+**Trade-offs:** The bonfire is hidden on very narrow or short panels where it
+would crowd the menu, so tiny terminals prioritize readable controls over the
+decorative element.
+
+---
+
+## 2026-05-05 — TUI mouse-wheel guard and no-category fallback
+
+**Context:** The animated picker/progress screens should not react to terminal
+mouse-wheel input, and category discovery should not block users from scraping
+sites that do not expose Fextralife-style sidebar categories. The final token
+summary also needed a more obvious file-count line in the ending report.
+
+**Decision:** Enable terminal mouse reporting while the TUI owns the alternate
+screen, parse mouse escape sequences, and ignore them so the scroll wheel does
+not move selection or scroll the weather frame. When interactive category
+discovery returns no categories, offer fallback actions to scrape the site via
+`/sitemap.xml`, scrape the entered URL directly, or choose another source. Add
+a compact `Final report: <files> files, <tokens> estimated tokens` line to the
+post-run token summary.
+
+**Rationale:** Mouse reporting prevents terminal scrollback from interfering
+with the animated UI and keeps wheel events out of the picker state machine.
+The no-category fallback preserves the interactive flow for non-Fextralife or
+less structured sites while continuing to reuse the existing sitemap and
+single-URL scrape paths.
+
+**Alternatives considered:** Disabling all mouse handling was rejected because
+many terminals send wheel input as navigation or scrollback unless the app
+claims mouse events. Treating no categories as a hard error was rejected
+because the user may still want broad sitemap scraping or direct URL scraping.
+
+**Trade-offs:** Sitemap fallback still depends on the target site exposing a
+usable `/sitemap.xml`; when it does not, users can fall back to scraping the
+entered URL directly.
+
+---
+
+## 2026-05-05 — Picker arrow-key fix and animated banner
+
+**Context:** The new interactive picker accepted `j/k`, but arrow-key movement
+could fail because terminals send arrows as multi-byte escape sequences and the
+picker was reading `Esc` too eagerly. The picker also felt more utilitarian
+than the scrape dashboard because it lacked a branded banner or weather layer.
+
+**Decision:** Make the picker key reader poll briefly for complete escape
+sequences and map common ANSI/xterm arrow forms before treating bare `Esc` as
+cancel. Rework picker rendering onto the same lightweight terminal canvas
+concept as the scrape dashboard, adding a centered `easyScrape` banner plus
+rain/cloud effects that repaint while waiting for input.
+
+**Rationale:** The input fix addresses the real terminal behavior without
+adding dependencies or changing the category selection state machine. Reusing
+the existing rain/cloud primitives keeps the visual language consistent across
+the pre-scrape picker and the in-scrape dashboard.
+
+**Alternatives considered:** Keeping the static picker and documenting `j/k`
+as the reliable controls was rejected because arrow keys are expected in a TUI.
+Switching to curses or another terminal framework was rejected because the
+project intentionally remains dependency-free.
+
+**Trade-offs:** The picker now repaints on a short timer while waiting for
+input, which is slightly busier than a purely blocking prompt but still small
+and local to interactive mode.
+
+---
+
+## 2026-05-05 — Interactive category picker TUI
+
+**Context:** The scraper had strong scripted modes and an animated progress
+dashboard, but the launch flow still required users to know the right
+`--discover` and `--category` sequence before scraping. The desired workflow is
+to launch the app, choose a source, discover broad categories such as Weapons
+and Armor, select the wanted categories, and then start the scrape from inside
+the terminal UI.
+
+**Decision:** Add a dependency-free pre-scrape interactive TUI. No-argument
+launch now opens a source picker for the default Dark Souls Fextralife wiki or a
+custom base URL, discovers categories through the existing sidebar parser, lets
+the user multi-select categories with keyboard controls, and then hands those
+categories to the existing category scrape runner. Add `--interactive` so the
+same picker can be forced while supplying defaults such as `--base`, `--out`,
+`--delay`, or `--download-images`.
+
+**Rationale:** Keeping the picker separate from `scrape_one`,
+`fetch_category_member_urls`, and `scrape_url_list` preserves the cleanup,
+caching, image, output, and token-summary behavior already covered by tests.
+The selector is just a launch-time coordinator; the progress dashboard remains
+the observer for the scrape itself.
+
+**Alternatives considered:** Replacing the CLI with a full-screen app was
+rejected because the existing scripted modes are useful for automation. Adding
+a terminal UI dependency was rejected to keep installation small. Treating a
+custom URL as a single page was rejected for this pass because the requested
+flow is category discovery from a site/wiki base.
+
+**Trade-offs:** Interactive mode requires both stdin and stdout to be TTYs and
+exits with a clear error otherwise. Explicit flags still preserve the old
+scriptable sitemap/category/discover behavior, so users who want sitemap mode
+now pass an explicit flag such as `--base`.
+
+---
+
 ## 2026-05-05 — Balanced scrape dashboard TUI
 
 **Context:** The first rain TUI made long runs feel better, but the centered

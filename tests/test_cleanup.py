@@ -10,8 +10,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import scrape as scrape_module  # noqa: E402
+
 from scrape import (  # noqa: E402
+    CategoryPickerState,
+    DEFAULT_OUTPUT_DIR,
+    FolderBrowserState,
     ImageAssetContext,
+    InteractiveScrapeTui,
     ScrapeRainTui,
     ScrapeTuiState,
     TerminalRainDrop,
@@ -19,13 +25,24 @@ from scrape import (  # noqa: E402
     TerminalLightningBolt,
     asset_filename_from_url,
     collect_markdown_corpus_stats,
+    display_path,
+    dispatch_mode,
     estimate_token_count,
     extract_frontmatter,
     extract_main_element,
     format_frontmatter,
     html_to_markdown,
+    key_name_from_sequence,
+    normalize_base_url,
+    normalize_existing_output_dir,
+    normalize_new_output_dir,
+    normalize_output_dir,
+    parse_args,
+    print_markdown_corpus_stats,
     progress_bar,
+    run_interactive_mode,
     scrape_one,
+    strip_ansi,
     url_to_title,
 )
 
@@ -236,9 +253,336 @@ def test_collect_markdown_corpus_stats_counts_nested_markdown(tmp_path):
     assert [file.path.name for file in stats.files] == ["Armor.md", "Sword.md"]
 
 
+def test_token_summary_includes_final_file_count_report(tmp_path, capsys):
+    (tmp_path / "Weapons").mkdir()
+    (tmp_path / "Weapons" / "Sword.md").write_text("abcd efgh", encoding="utf-8")
+
+    print_markdown_corpus_stats(tmp_path)
+
+    output = capsys.readouterr().out
+    assert "Markdown files: 1" in output
+    assert "Final report: 1 files, 3 estimated tokens" in output
+
+
 def test_progress_bar_formats_completed_work():
     assert progress_bar(2, 4, 10) == "[####....]"
     assert progress_bar(0, 0, 6) == "[....]"
+
+
+def test_dispatch_mode_defaults_to_interactive_without_args():
+    args = parse_args([])
+
+    assert dispatch_mode(args, []) == "interactive"
+
+
+def test_dispatch_mode_preserves_explicit_scripted_modes():
+    def mode(argv: list[str]) -> str:
+        return dispatch_mode(parse_args(argv), argv)
+
+    assert mode(["--discover"]) == "discover"
+    assert mode(["--category", "Weapons"]) == "category"
+    assert mode(["--stats-only"]) == "stats"
+    assert mode(["--base", "https://eldenring.wiki.fextralife.com"]) == "sitemap"
+    assert (
+        mode(["--interactive", "--base", "https://bloodborne.wiki.fextralife.com"])
+        == "interactive"
+    )
+
+
+def test_normalize_base_url_accepts_custom_base_urls():
+    assert normalize_base_url("") == "https://darksouls.wiki.fextralife.com"
+    assert (
+        normalize_base_url("darksouls.wiki.fextralife.com/")
+        == "https://darksouls.wiki.fextralife.com"
+    )
+    assert (
+        normalize_base_url("HTTP://Example.COM/wiki/?ignored=yes#section")
+        == "http://example.com/wiki"
+    )
+    with pytest.raises(ValueError):
+        normalize_base_url("ftp://example.com")
+
+
+def test_parse_args_defaults_to_desktop_output_dir():
+    args = parse_args([])
+
+    assert args.out == DEFAULT_OUTPUT_DIR
+    assert display_path(args.out) == "~/Desktop/easy_scrape_output"
+
+
+def test_normalize_output_dir_accepts_default_and_rejects_files(tmp_path):
+    default_path = tmp_path / "default"
+    custom_path = tmp_path / "custom"
+    existing_file = tmp_path / "not-a-dir"
+    existing_file.write_text("not a directory", encoding="utf-8")
+
+    assert normalize_output_dir("", default_path) == default_path
+    assert normalize_output_dir(str(custom_path), default_path) == custom_path
+    with pytest.raises(ValueError):
+        normalize_output_dir(str(existing_file), default_path)
+
+
+def test_folder_browser_default_action_returns_default_output(tmp_path):
+    state = FolderBrowserState(DEFAULT_OUTPUT_DIR, tmp_path)
+    state.refresh()
+
+    state.handle_key("enter")
+
+    assert state.submitted == DEFAULT_OUTPUT_DIR
+
+
+def test_folder_browser_opens_child_directory(tmp_path):
+    child = tmp_path / "Child"
+    child.mkdir()
+    state = FolderBrowserState(DEFAULT_OUTPUT_DIR, tmp_path)
+    state.refresh()
+    state.cursor = 2
+
+    state.handle_key("enter")
+
+    assert state.current_dir == child
+    assert state.cursor == 1
+    assert state.submitted is None
+
+
+def test_folder_browser_parent_home_and_desktop_shortcuts(tmp_path, monkeypatch):
+    desktop = tmp_path / "Desktop"
+    nested = desktop / "Nested"
+    nested.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    state = FolderBrowserState(DEFAULT_OUTPUT_DIR, nested)
+    state.refresh()
+    state.handle_key("backspace")
+    assert state.current_dir == desktop
+
+    state.handle_key("~")
+    assert state.current_dir == tmp_path
+
+    state.handle_key("d")
+    assert state.current_dir == desktop
+
+
+def test_folder_browser_direct_path_validates_existing_directories(tmp_path):
+    existing_dir = tmp_path / "existing"
+    existing_dir.mkdir()
+    existing_file = tmp_path / "not-a-dir"
+    existing_file.write_text("not a directory", encoding="utf-8")
+    state = FolderBrowserState(DEFAULT_OUTPUT_DIR, tmp_path)
+
+    state.submit_direct_path("existing")
+    assert state.submitted == existing_dir
+
+    with pytest.raises(ValueError):
+        normalize_existing_output_dir(str(existing_file), tmp_path)
+    with pytest.raises(ValueError):
+        normalize_existing_output_dir(str(tmp_path / "missing"), tmp_path)
+
+
+def test_folder_browser_new_folder_returns_path_without_creating(tmp_path):
+    state = FolderBrowserState(DEFAULT_OUTPUT_DIR, tmp_path)
+
+    state.submit_new_folder("New Scrape")
+
+    assert state.submitted == tmp_path / "New Scrape"
+    assert not state.submitted.exists()
+
+    with pytest.raises(ValueError):
+        normalize_new_output_dir("nested/path", tmp_path)
+
+
+def test_category_picker_state_toggles_and_submits_selection():
+    state = CategoryPickerState(["Weapons", "Armor", "Bosses"])
+
+    state.handle_key("down")
+    state.handle_key("space")
+    assert state.cursor == 1
+    assert state.selected_categories() == ["Armor"]
+
+    state.handle_key("a")
+    assert state.selected_categories() == ["Weapons", "Armor", "Bosses"]
+
+    state.handle_key("n")
+    assert state.selected_categories() == []
+    state.handle_key("enter")
+    assert not state.submitted
+    assert "Select at least one" in state.message
+
+    state.handle_key("space")
+    state.handle_key("enter")
+    assert state.submitted
+    assert state.selected_categories() == ["Armor"]
+
+
+def test_category_picker_state_q_cancels():
+    state = CategoryPickerState(["Weapons"])
+
+    state.handle_key("q")
+
+    assert state.cancelled
+
+
+def test_terminal_escape_sequences_map_to_arrow_keys():
+    assert key_name_from_sequence("\x1b[A") == "up"
+    assert key_name_from_sequence("\x1b[B") == "down"
+    assert key_name_from_sequence("\x1bOA") == "up"
+    assert key_name_from_sequence("\x1b[1;5B") == "down"
+    assert key_name_from_sequence("\x1b[<64;12;8M") == "mouse"
+    assert key_name_from_sequence("\x1b[M`!!") == "mouse"
+    assert key_name_from_sequence("\x1b") == "escape"
+
+
+def test_interactive_picker_frame_has_banner_and_rain_state():
+    class FakeStream:
+        def __init__(self):
+            self.writes = []
+
+        def isatty(self):
+            return True
+
+        def write(self, text):
+            self.writes.append(text)
+
+        def flush(self):
+            pass
+
+    stream = FakeStream()
+    tui = InteractiveScrapeTui(stream=stream)
+
+    frame = strip_ansi(
+        tui._draw_frame(80, 24, "Choose a source", ["> Dark Souls"], "q quit")
+    )
+
+    assert "easyScrape" in frame or "___  __" in frame
+    assert "Choose a source" in frame
+    assert "####" in frame
+    assert "_/====\\_" in frame
+    assert tui._rain.drops
+
+
+def test_interactive_mode_requires_tty_streams():
+    class FakeStream:
+        def isatty(self):
+            return False
+
+    args = parse_args(["--interactive"])
+
+    with pytest.raises(SystemExit) as exc:
+        run_interactive_mode(
+            session=object(),
+            args=args,
+            stream=FakeStream(),
+            input_stream=FakeStream(),
+        )
+
+    assert exc.value.code == 1
+
+
+def test_interactive_no_categories_can_fall_back_to_single_url(monkeypatch):
+    calls = {}
+
+    class FakeTui:
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_available(self):
+            return True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def choose_source(self, _default_base_url):
+            return "default"
+
+        def show_status(self, _title, _detail):
+            return None
+
+        def choose_no_category_fallback(self, base_url):
+            calls["fallback_base"] = base_url
+            return "single"
+
+        def choose_output_path(self, default_output_path):
+            calls["default_output"] = default_output_path
+            return Path("/tmp/easy-scrape-custom")
+
+    def fake_discover(_session, _base_url):
+        return []
+
+    def fake_single(_session, args, url):
+        calls["single"] = (args.base, args.out, url)
+
+    monkeypatch.setattr(scrape_module, "InteractiveScrapeTui", FakeTui)
+    monkeypatch.setattr(scrape_module, "discover_sidebar_categories", fake_discover)
+    monkeypatch.setattr(scrape_module, "run_single_url_mode", fake_single)
+
+    args = parse_args(["--interactive", "--base", "example.com/docs"])
+    run_interactive_mode(object(), args)
+
+    assert calls["fallback_base"] == "https://example.com/docs"
+    assert calls["default_output"] == DEFAULT_OUTPUT_DIR
+    assert calls["single"] == (
+        "https://example.com/docs",
+        Path("/tmp/easy-scrape-custom"),
+        "https://example.com/docs",
+    )
+
+
+def test_interactive_category_selection_sets_output_before_scrape(monkeypatch):
+    calls = {}
+
+    class FakeTui:
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_available(self):
+            return True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def choose_source(self, _default_base_url):
+            return "default"
+
+        def show_status(self, _title, _detail):
+            return None
+
+        def choose_categories(self, categories, *, base_url):
+            calls["category_prompt"] = (categories, base_url)
+            return ["Weapons"]
+
+        def choose_output_path(self, default_output_path):
+            calls["default_output"] = default_output_path
+            return Path("/tmp/easy-scrape-categories")
+
+    def fake_discover(_session, _base_url):
+        return ["Weapons", "Armor"]
+
+    def fake_category(_session, args):
+        calls["category_run"] = (args.base, args.out, args.category)
+
+    monkeypatch.setattr(scrape_module, "InteractiveScrapeTui", FakeTui)
+    monkeypatch.setattr(scrape_module, "discover_sidebar_categories", fake_discover)
+    monkeypatch.setattr(scrape_module, "run_category_mode", fake_category)
+
+    args = parse_args(["--interactive"])
+    run_interactive_mode(object(), args)
+
+    assert calls["category_prompt"] == (
+        ["Weapons", "Armor"],
+        "https://darksouls.wiki.fextralife.com",
+    )
+    assert calls["default_output"] == DEFAULT_OUTPUT_DIR
+    assert calls["category_run"] == (
+        "https://darksouls.wiki.fextralife.com",
+        Path("/tmp/easy-scrape-categories"),
+        ["Weapons"],
+    )
 
 
 def test_rain_system_splashes_on_tui_panel():

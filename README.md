@@ -37,7 +37,47 @@ If the wiki you want isn't listed: open it in a browser, copy the base URL
 
 ## Workflow
 
-### 1. Discover what categories the wiki has
+### Interactive category scrape
+
+Run the script with no flags to open the interactive picker:
+
+```bash
+.venv/bin/python scrape.py
+```
+
+The TUI opens with an `easyScrape` banner, light rain/cloud effects, and a
+source picker. It lets you choose the default Dark Souls Fextralife wiki or
+enter a custom base URL, discovers the wiki sidebar categories, and gives you a
+multi-select category list. Before scraping starts, it asks where to write the
+files with an in-terminal folder browser. The default action writes to
+`~/Desktop/easy_scrape_output`; you can also browse folders, use the current
+folder, create a named child folder, or type an existing path directly. Use
+`up/down` or `j/k` to move, `space` to toggle categories, `a` to select all,
+`n` to clear categories or name a new output folder, `/` to type an output
+path, `backspace` to browse to a parent folder, `~` for home, `d` for Desktop,
+`enter` to continue, and `q` to quit.
+Mouse-wheel events are ignored by the TUI so scrolling does not disturb the
+weather effects or selection.
+
+If the target site has no discoverable sidebar categories, the TUI offers
+fallback scrape choices: scrape via `/sitemap.xml` or scrape only the entered
+URL.
+
+You can also force the picker while still supplying defaults:
+
+```bash
+.venv/bin/python scrape.py \
+  --interactive \
+  --base https://eldenring.wiki.fextralife.com \
+  --out elden-ring
+```
+
+After category and output-folder selection, the scrape uses the same organized
+category folders and animated progress dashboard as scripted category mode.
+
+### Scripted workflow
+
+#### 1. Discover what categories the wiki has
 
 ```bash
 .venv/bin/python scrape.py --base <wiki-url> --discover
@@ -47,7 +87,7 @@ This prints the wiki's sidebar nav as a flat list of category names —
 typically 60-100 entries like `Weapons`, `Armor`, `Bosses`, `Spells`,
 `Rings`, etc. Pick the ones you want.
 
-### 2. Preview a category before committing
+#### 2. Preview a category before committing
 
 ```bash
 .venv/bin/python scrape.py --base <wiki-url> --category Weapons --list-only
@@ -57,7 +97,7 @@ Prints the URLs that would be downloaded — sanity-check that the hub gives
 clean results (some hubs are sub-indexes that link to other hubs rather
 than to individual pages).
 
-### 3. Scrape into organized folders
+#### 3. Scrape into organized folders
 
 ```bash
 .venv/bin/python scrape.py \
@@ -67,10 +107,11 @@ than to individual pages).
   --category Bosses
 ```
 
-Each category becomes its own subfolder under `output/`:
+Each category becomes its own subfolder under the chosen output root. By
+default, that root is `~/Desktop/easy_scrape_output`:
 
 ```
-output/
+~/Desktop/easy_scrape_output/
 ├── Weapons/
 ├── Armor/
 └── Bosses/
@@ -83,9 +124,10 @@ links; promotes useful image alt text into table labels; normalizes repeated
 game-name headings; and drops placeholder sections such as `N/A` notes.
 
 Every scrape run ends with a token summary for the final Markdown collection:
-Markdown file count, bytes, words, estimated tokens, and the largest files. The
-token estimate is intentionally stable and dependency-free (`~4 chars/token`),
-so you can compare different scrape versions and category collections over time.
+Markdown file count, bytes, words, estimated tokens, a compact final
+file/token report, and the largest files. The token estimate is intentionally
+stable and dependency-free (`~4 chars/token`), so you can compare different
+scrape versions and category collections over time.
 
 Interactive terminal scrapes render a structured dashboard with weather effects
 inspired by the sibling `weathr` app: drifting clouds, rain, splashes, and rare
@@ -112,7 +154,7 @@ meaningful article images downloaded for AI workflows:
 ```
 
 This keeps stat/table icons as text labels, but downloads real content images
-from the page into `output/assets/<page-slug>/` and writes relative image
+from the page into `<out>/assets/<page-slug>/` and writes relative image
 references into the Markdown, such as:
 
 ```md
@@ -121,7 +163,8 @@ references into the Markdown, such as:
 
 ### Or scrape everything (sitemap mode)
 
-If you want every page in the wiki, drop `--category`:
+If you want every page in the wiki, pass an explicit flag such as `--base` and
+drop `--category`:
 
 ```bash
 .venv/bin/python scrape.py --base <wiki-url>
@@ -182,9 +225,10 @@ simple title/source header and no YAML frontmatter.
 | flag           | default                                 | purpose                                  |
 | -------------- | --------------------------------------- | ---------------------------------------- |
 | `--base`       | `https://darksouls.wiki.fextralife.com` | wiki subdomain                           |
-| `--out`        | `output`                                | output directory                         |
+| `--out`        | `~/Desktop/easy_scrape_output`          | output directory                         |
 | `--category`   | none                                    | hub name; repeat to scrape several       |
 | `--discover`   | off                                     | print sidebar categories, do nothing else |
+| `--interactive` | off                                    | open source/category picker              |
 | `--filter`     | none                                    | regex over URL (sitemap mode only)       |
 | `--limit`      | none                                    | stop after N URLs                        |
 | `--delay`      | `1.0`                                   | seconds between requests                 |
@@ -201,8 +245,9 @@ Category names with spaces use the wiki's URL form: `Ashes+of+War`,
 
 ## How it works
 
-1. **Choose URL source** — `/sitemap.xml` for the whole wiki, or a hub
-   page (e.g. `/Weapons`) plus its in-content links for category mode.
+1. **Choose URL source** — the no-arg interactive picker discovers categories
+   first; scripted modes use `/sitemap.xml` for the whole wiki, or a hub page
+   (e.g. `/Weapons`) plus its in-content links for category mode.
 2. **Fetch the page** with browser-like headers; auto-retry on 429/5xx.
 3. **Fetch or replay** the raw HTML, optionally using `--cache-dir`.
 4. **Extract** only `<div id="wiki-content-block">` (the article body).

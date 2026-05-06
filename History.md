@@ -18,6 +18,74 @@ Format per entry:
 
 ---
 
+## 2026-05-06 — Post-run folder stats browser
+
+**Context:** The scraper printed useful corpus totals after a run, but users
+still had to inspect output folders manually to understand which extracted
+categories were large, how many Markdown files each produced, or which folder
+they should open next to manage the generated data.
+
+**Decision:** Add top-level output folder grouping to the Markdown stats layer
+and a dependency-free post-run TUI for browsing those groups. Interactive
+scrapes open the browser by default after the token summary. Scripted or
+stats-only runs can opt in with `--browse-stats`, and interactive runs can
+skip it with `--no-browse-stats`. The browser uses arrow keys to move through
+folders, Enter/right arrow to inspect a folder's Markdown contents, left
+arrow/backspace to return, `r` to refresh stats, and `o` to reveal the
+selected folder in the OS file manager.
+
+**Rationale:** The final summary already computes stable bytes, characters,
+words, and token estimates for every Markdown file, so grouping that same data
+by output folder keeps the UI consistent with the printed report. Keeping the
+browser in the terminal preserves the scraper's dependency-free interactive
+architecture and reuses the shared terminal session/key-reader primitives.
+
+**Alternatives considered:** Adding a separate web UI was rejected because the
+current product surface is a terminal scraper and the needed data already
+exists locally after a run. Making the browser mandatory for every scripted
+run was rejected because it would break automation and redirected output.
+
+**Trade-offs:** Folder groups are based on Markdown files under the output
+root's top-level directories, plus direct root Markdown files for sitemap-style
+scrapes. The browser lists files and can reveal folders, but it does not edit
+or delete generated data inside the TUI.
+
+## 2026-05-05 — Package split with compatibility facade
+
+**Context:** `scrape.py` had grown into a whole-app module containing cleanup
+rules, URL discovery, scrape orchestration, stats, CLI mode dispatch, the
+interactive picker, terminal drawing primitives, weather effects, and progress
+dashboard behavior. That made behavior-preserving changes riskier because
+small cleanup edits had to share a file with unrelated TUI and runner code.
+
+**Decision:** Split the implementation into an `easy_scrape` package while
+keeping `scrape.py` as the executable entrypoint and import facade. Cleanup,
+fetching, pipeline orchestration, stats, CLI runners, and TUI pieces now live
+in focused modules. The scrape pipeline now has `ScrapeOptions`,
+`ScrapeResult`, and `ScrapeBatchResult` internally while the legacy
+`scrape_one` and `scrape_url_list` wrappers keep their previous return shapes.
+The ordered HTML cleanup flow is represented as named cleanup pipeline steps,
+and both terminal UIs share `TerminalSession` and `KeyReader` for alternate
+screen, mouse, cursor, cbreak, restore, and escape-sequence handling.
+
+**Rationale:** Preserving `python scrape.py` and top-level imports keeps the
+user-facing surface stable while giving future agents smaller files and clearer
+ownership boundaries. Structured pipeline results make runner code easier to
+read without changing printed logs or generated Markdown. Named cleanup steps
+document the order-sensitive behavior that fixture tests protect.
+
+**Alternatives considered:** A plugin architecture, async/concurrent scraping,
+Textual/curses rewrite, or new YAML dependency were rejected because this pass
+was meant to reduce risk before changing capabilities. Removing the facade was
+rejected because README examples and existing tests still depend on `scrape.py`
+as the public script/import path.
+
+**Trade-offs:** The facade intentionally re-exports compatibility names, so
+some old public symbols remain available even though the implementation now
+lives elsewhere. The package split is mechanical and behavior-preserving; it
+does not attempt to redesign scraping concurrency, output formats, or the TUI
+visual language.
+
 ## 2026-05-05 — Visible all-categories selection and fuller totals
 
 **Context:** The interactive category picker supported selecting every

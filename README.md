@@ -129,6 +129,14 @@ final report with total files/tokens/words/chars, and the largest files. The
 token estimate is intentionally stable and dependency-free (`~4 chars/token`),
 so you can compare different scrape versions and category collections over time.
 
+Interactive terminal runs then open a folder stats browser by default. Use the
+arrow keys to move through each extracted output folder and see its Markdown
+file count, file size, characters, words, estimated tokens, and largest files.
+Press `enter` or the right arrow to open the selected folder's contents list in
+the UI, the left arrow or backspace to return to folders, and `o` to reveal the
+selected folder in your OS file manager. Scripted runs can opt in with
+`--browse-stats`; interactive runs can skip it with `--no-browse-stats`.
+
 Interactive terminal scrapes render a structured dashboard with weather effects
 inspired by the sibling `weathr` app: drifting clouds, rain, splashes, and rare
 lightning. The dashboard shows the active mode, current stage, output path,
@@ -235,6 +243,8 @@ simple title/source header and no YAML frontmatter.
 | `--overwrite`  | off                                     | re-download files that already exist     |
 | `--list-only`  | off                                     | print URLs only, don't download anything |
 | `--stats-only` | off                                     | only count existing Markdown under `--out` |
+| `--browse-stats` | off for scripted, on after interactive scrapes | open the folder stats browser after the token summary |
+| `--no-browse-stats` | off                                | skip the folder stats browser in interactive mode |
 | `--cache-dir`  | none                                    | cache raw HTML and replay from disk      |
 | `--download-images` | off                                | download meaningful article images in clean mode |
 | `--no-tui`     | off                                     | disable animated rain progress UI        |
@@ -262,7 +272,9 @@ Category names with spaces use the wiki's URL form: `Ashes+of+War`,
    stdout is a real terminal; otherwise preserve plain logs.
 10. **Summarize tokens** for the final Markdown collection using a stable
    `~4 chars/token` estimate.
-11. **Politeness:** 1s default delay, retry/backoff, skip files that
+11. **Browse folder stats** after interactive scrapes so users can compare
+   extracted folders and open their contents without leaving the terminal flow.
+12. **Politeness:** 1s default delay, retry/backoff, skip files that
    already exist (so you can interrupt and resume safely).
 
 ## Tests

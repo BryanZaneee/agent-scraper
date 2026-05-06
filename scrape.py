@@ -13,11 +13,14 @@ from easy_scrape.cleanup import (
     ImageAssetContext,
     POST_LINK_CLEANUP_PIPELINE,
     PRE_LINK_CLEANUP_PIPELINE,
+    _clean_label,
     asset_filename_from_url,
     download_image_asset,
     drop_banner_alt_rows,
     drop_empty_columns,
     drop_empty_headings,
+    drop_empty_sections,
+    drop_external_image_placeholders,
     drop_footer_nav_table,
     drop_fragment_anchors,
     drop_placeholder_sections,
@@ -32,6 +35,7 @@ from easy_scrape.cleanup import (
     replace_images_with_alt,
     run_cleanup_pipeline,
     strip_inline_links,
+    strip_wip_tokens,
 )
 from easy_scrape.cli import (
     dispatch_mode,

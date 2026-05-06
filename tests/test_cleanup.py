@@ -9,11 +9,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scrape import (  # noqa: E402
     ImageAssetContext,
+    _clean_label,
     asset_filename_from_url,
+    drop_empty_sections,
+    drop_external_image_placeholders,
     extract_frontmatter,
     extract_main_element,
     format_frontmatter,
     html_to_markdown,
+    strip_wip_tokens,
     url_to_title,
 )
 
@@ -156,6 +160,100 @@ def test_image_download_does_not_capture_stat_icons(tmp_path):
     assert downloads == []
     assert "![" not in md
     assert "Boss 0036 Asylum Demon" not in md
+
+def test_clean_label_strips_alt_text_leak_words():
+    # Banner-style alt-text like "Sens Fortress walkthrough wiki guide"
+    # collapses to just the page name, killing the H1 alt-text leak pattern.
+    assert _clean_label("Sens Fortress walkthrough wiki guide") == "Sens Fortress"
+    # File-extension residue from icon images is stripped.
+    cleaned = _clean_label("prot phy png")
+    assert "png" not in cleaned.lower()
+    # Legitimate stat-icon labels are untouched.
+    assert _clean_label("Physical Defense") == "Physical Defense"
+    assert _clean_label("Strength") == "Strength"
+    assert _clean_label("Stability") == "Stability"
+
+
+def test_replace_images_with_alt_dedupes_stuttered_heading():
+    # Catalog/hub page context: an NPC sub-section heading has both an alt
+    # text image and the rendered name. We must not stutter the heading.
+    html = (
+        '<div id="wiki-content-block">'
+        "<h1>Merchants</h1>"
+        '<h2><img alt="griggs of vinheim"/>Griggs of Vinheim</h2>'
+        "<p>Sells sorceries.</p>"
+        "</div>"
+    )
+    el = extract_main_element(html, "https://x.test/Merchants", clean=True)
+    assert el is not None
+    md = html_to_markdown(str(el), title="Merchants", clean=True)
+    assert "## Griggs of Vinheim" in md
+    assert "griggs of vinheim Griggs of Vinheim" not in md.lower()
+
+
+def test_drop_empty_sections_removes_stub_walkthrough_header():
+    md = (
+        "## Strategy\n\n"
+        "Roll behind him.\n\n"
+        "### Video Walkthrough\n\n"
+        "### Notes\n\n"
+        "Has health.\n"
+    )
+    out = drop_empty_sections(md)
+    assert "### Video Walkthrough" not in out
+    assert "### Notes" in out
+    assert "Roll behind him." in out
+
+
+def test_drop_empty_sections_collapses_stacked_empties_and_trailing_eof():
+    md = "## Foo\n\nBody\n\n### A\n\n### B\n\n### C\n"
+    out = drop_empty_sections(md)
+    assert "### A" not in out and "### B" not in out and "### C" not in out
+    assert "## Foo" in out and "Body" in out
+
+
+def test_drop_empty_sections_preserves_section_with_inline_body():
+    md = "## Foo\n\nReal body\n\n### Bar\n\nReal body 2\n"
+    out = drop_empty_sections(md)
+    assert "## Foo" in out and "### Bar" in out
+    assert "Real body 2" in out
+
+
+def test_strip_wip_tokens_removes_inline_and_standalone():
+    assert strip_wip_tokens("- Damage 100 (WIP)") == "- Damage 100"
+    assert strip_wip_tokens("(Work in progress)") == ""
+    assert strip_wip_tokens("Notes (WIP) and tips") == "Notes and tips"
+    # Pre-existing blank line preserved (paragraph spacing intact).
+    assert "\n\n" in strip_wip_tokens("Para 1\n\nPara 2 (WIP)\n")
+
+
+def test_drop_external_image_placeholders_strips_broken_image_lines():
+    md = "Para A\n\nexternal image abc123def456 jpg\n\nPara B"
+    out = drop_external_image_placeholders(md)
+    assert "external image" not in out
+    assert "Para A" in out and "Para B" in out
+
+
+def test_html_to_markdown_pipeline_strips_wip_and_external_image_residue():
+    # End-to-end: empty header + WIP marker + broken image line all clear in
+    # one html_to_markdown pass.
+    html = (
+        '<div id="wiki-content-block">'
+        "<h2>Strategy</h2><p>Real body.</p>"
+        "<h3>Video Walkthrough</h3>"
+        "<h3>Notes</h3>"
+        "<p>Damage 100 (WIP)</p>"
+        "<p>external image abc123def456 jpg</p>"
+        "</div>"
+    )
+    el = extract_main_element(html, "https://x.test/Foo", clean=True)
+    assert el is not None
+    md = html_to_markdown(str(el), title="Foo", clean=True)
+    assert "Video Walkthrough" not in md
+    assert "(WIP)" not in md
+    assert "external image" not in md
+    assert "Strategy" in md and "Damage 100" in md
+
 
 def test_asset_filename_from_url_sanitizes_and_deduplicates():
     seen: set[str] = set()

@@ -12,6 +12,7 @@ from urllib3.util.retry import Retry
 
 from .constants import (
     BROWSER_HEADERS,
+    CATEGORY_DISCOVERY_BLOCKLIST,
     CONTENT_SELECTOR,
     FILENAME_FORBIDDEN,
     HUB_LINK_BLOCKLIST,
@@ -68,7 +69,10 @@ def discover_sidebar_categories(
                 continue
             if any(b.strip("/") == path for b in HUB_LINK_BLOCKLIST):
                 continue
-            names.add(unquote(path))
+            unquoted = unquote(path)
+            if any(b.lower() == unquoted.lower() for b in CATEGORY_DISCOVERY_BLOCKLIST):
+                continue
+            names.add(unquoted)
         if names:
             return sorted(names, key=str.lower)
     return []

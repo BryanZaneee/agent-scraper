@@ -248,3 +248,186 @@ def test_scrape_facade_exports_legacy_public_symbols():
         "main",
     ):
         assert hasattr(scrape, name)
+
+
+def test_discover_sidebar_categories_drops_curated_junk(monkeypatch):
+    sample_html = (
+        '<div class="wiki-menu-2-left">'
+        '<a href="/Weapons">Weapons</a>'
+        '<a href="/Armor">Armor</a>'
+        '<a href="/Comedy">Comedy</a>'
+        '<a href="/Chatroom">Chatroom</a>'
+        '<a href="/Build+Calculator">Build Calculator</a>'
+        '<a href="/Fan+Art">Fan Art</a>'
+        '<a href="/Community+Events">Community Events</a>'
+        '<a href="/todo">todo</a>'
+        "</div>"
+    )
+
+    class FakeResponse:
+        text = sample_html
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+    class FakeSession:
+        def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    from easy_scrape.fetching import discover_sidebar_categories
+
+    names = discover_sidebar_categories(FakeSession(), "https://x.test")
+    assert "Weapons" in names
+    assert "Armor" in names
+    for blocked in ("Comedy", "Chatroom", "Build Calculator", "Fan Art", "Community Events", "todo"):
+        assert blocked not in names
+
+
+def test_run_category_mode_skips_categories_with_no_members(monkeypatch, tmp_path):
+    fetched = []
+    scraped = []
+
+    def fake_fetch(_session, _base, cat):
+        fetched.append(cat)
+        if cat == "Weapons":
+            return (
+                f"https://x.test/{cat}",
+                ["https://x.test/Drake+Sword"],
+            )
+        return (f"https://x.test/{cat}", [])
+
+    def fake_scrape_pages(*_args, **kwargs):
+        scraped.append(kwargs.get("label", "").strip())
+        from easy_scrape.pipeline import ScrapeBatchResult
+
+        return ScrapeBatchResult()
+
+    monkeypatch.setattr(cli_module, "fetch_category_member_urls", fake_fetch)
+    monkeypatch.setattr(cli_module, "scrape_pages", fake_scrape_pages)
+    monkeypatch.setattr(
+        cli_module,
+        "ScrapeRainTui",
+        lambda **_kw: _NullTui(),
+    )
+    monkeypatch.setattr(cli_module, "finish_with_markdown_stats", lambda _args: None)
+
+    args = parse_args(["--category", "Weapons", "--category", "Comedy", "--no-tui"])
+    args.out = tmp_path
+    args.delay = 0
+    cli_module.run_category_mode(object(), args)
+
+    assert fetched == ["Weapons", "Comedy"]
+    # Comedy returned no members → scrape_pages must not be called for it.
+    assert scraped == ["[Weapons]"]
+
+
+def test_run_category_mode_dedups_urls_across_categories(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_fetch(_session, _base, cat):
+        # Drake Sword belongs to both Weapons (first) and Items.
+        return (
+            f"https://x.test/{cat}",
+            [
+                "https://x.test/Drake+Sword",
+                f"https://x.test/{cat}-only",
+            ],
+        )
+
+    def fake_scrape_pages(_session, urls, *_args, **kwargs):
+        captured.append((kwargs.get("label", "").strip(), list(urls)))
+        seen = kwargs.get("seen_urls")
+        from easy_scrape.pipeline import ScrapeBatchResult
+
+        if seen is not None:
+            for u in urls:
+                seen.add(u)
+        return ScrapeBatchResult()
+
+    monkeypatch.setattr(cli_module, "fetch_category_member_urls", fake_fetch)
+    monkeypatch.setattr(cli_module, "scrape_pages", fake_scrape_pages)
+    monkeypatch.setattr(
+        cli_module,
+        "ScrapeRainTui",
+        lambda **_kw: _NullTui(),
+    )
+    monkeypatch.setattr(cli_module, "finish_with_markdown_stats", lambda _args: None)
+
+    args = parse_args(["--category", "Weapons", "--category", "Items", "--no-tui"])
+    args.out = tmp_path
+    args.delay = 0
+    cli_module.run_category_mode(object(), args)
+
+    weapons_urls = next(u for lbl, u in captured if lbl == "[Weapons]")
+    items_urls = next(u for lbl, u in captured if lbl == "[Items]")
+
+    assert "https://x.test/Drake+Sword" in weapons_urls
+    # Drake Sword was claimed by Weapons; Items must not see it again.
+    assert "https://x.test/Drake+Sword" not in items_urls
+    # Each cat still gets its own unique URL.
+    assert "https://x.test/Weapons-only" in weapons_urls
+    assert "https://x.test/Items-only" in items_urls
+
+
+def test_scrape_page_skips_stub_below_min_body(monkeypatch, tmp_path):
+    from bs4 import BeautifulSoup
+
+    from easy_scrape import pipeline
+
+    monkeypatch.setattr(pipeline, "html_to_markdown", lambda *_a, **_k: "tiny.")
+    monkeypatch.setattr(
+        pipeline,
+        "extract_main_element",
+        lambda *_a, **_k: BeautifulSoup("<div/>", "lxml").div,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_frontmatter",
+        lambda *_a, **_k: {"title": "x", "url": "x"},
+    )
+
+    class FakeResponse:
+        status_code = 200
+        text = "<html></html>"
+        headers = {}
+        content = b"<html></html>"
+
+        def raise_for_status(self):
+            pass
+
+    class FakeSession:
+        def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    out = tmp_path / "Stub.md"
+    result = pipeline.scrape_page(
+        FakeSession(),
+        "https://x.test/Stub",
+        out,
+        pipeline.ScrapeOptions(overwrite=True, category="Items"),
+    )
+
+    assert result.status == "skipped"
+    assert not out.exists()
+
+
+class _NullTui:
+    """Minimal context-manager stand-in for ScrapeRainTui in unit tests."""
+
+    active = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def set_stage(self, *_args, **_kwargs):
+        return None
+
+    def start_batch(self, *_args, **_kwargs):
+        return None
+
+    def update_stage(self, *_args, **_kwargs):
+        return None

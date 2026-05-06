@@ -334,6 +334,7 @@ def run_single_url_mode(
 
 
 def run_category_mode(session: requests.Session, args: argparse.Namespace) -> None:
+    seen_urls: set[str] = set()
     total_saved = total_skipped = total_failed = 0
     with ScrapeRainTui(enabled=args.tui and not args.list_only) as tui:
         for cat in args.category:
@@ -358,7 +359,22 @@ def run_category_mode(session: requests.Session, args: argparse.Namespace) -> No
                 total_failed += 1
                 continue
 
+            if not members:
+                print(f"  {cat_label}: 0 members — skipping")
+                continue
+
             urls = [hub_url] + members
+            before = len(urls)
+            urls = [u for u in urls if u not in seen_urls]
+            cross_skipped = before - len(urls)
+            if cross_skipped:
+                print(
+                    f"  {cat_label}: skipped {cross_skipped} URL(s) already "
+                    "claimed by earlier categories"
+                )
+            if not urls:
+                continue
+
             if args.limit:
                 urls = urls[: args.limit]
 
@@ -393,6 +409,7 @@ def run_category_mode(session: requests.Session, args: argparse.Namespace) -> No
                 ),
                 label=f"  [{cat_label}] ",
                 tui=tui,
+                seen_urls=seen_urls,
             )
             total_saved += result.saved
             total_skipped += result.skipped

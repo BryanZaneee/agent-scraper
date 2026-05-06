@@ -18,6 +18,72 @@ Format per entry:
 
 ---
 
+## 2026-05-06 — Cross-category dedup + content noise sweep
+
+**Context:** A downstream audit of a 3,494-file Dark Souls knowledge base produced
+by the scraper found three classes of defects: 57.9% file redundancy (the same
+URL written under every category that listed it, e.g. Drake Sword in both
+Weapons and Items), 80 top-level categories that included junk (Comedy, Build
+Calculator, Chatroom, Fan Art, Community Events, todo) and synonym/subset
+duplicates (Bonfire/Bonfires, Steam ID/Playstation Network ID/Player IDs,
+Magic/Sorceries), and persistent body-noise patterns the existing cleanup
+helpers did not catch — 810 empty section headers (`### Video Walkthrough`
+followed immediately by another header), 507 H1 alt-text leaks
+("sens fortress walkthrough wiki guide" under the title), 140 (WIP) markers,
+40 inline icon tokens (`prot phy png`), 15 `external image <hash> jpg`
+placeholders, ~16 stuttered headers (`## griggs of vinheim Griggs of Vinheim`),
+and 11 stub files <200 chars.
+
+**Decision:** Nine surgical fixes, no new dependencies, no architectural
+overhaul. Skip-first-wins URL dedup in `run_category_mode` via a `seen_urls`
+set threaded into `scrape_pages`; `CATEGORY_DISCOVERY_BLOCKLIST` filtered in
+`discover_sidebar_categories` paired with an empty-category short-circuit in
+`run_category_mode`; extension of `_LABEL_NOISE_RE` to strip wiki/guide/
+walkthrough/map/png/jpe?g/gif/webp; new `drop_empty_sections`,
+`strip_wip_tokens`, and `drop_external_image_placeholders` markdown-level
+helpers wired into `html_to_markdown` after the existing
+`drop_placeholder_sections`; a heading-aware branch in `replace_images_with_alt`
+that decomposes images whose alt phrase already appears in the parent heading;
+and a stub-file guard in `scrape_page` that returns `"skipped"` (not
+`"failed"`) when the cleaned body is below 200 characters so the dedup set
+still claims the URL. New regression coverage: 12 tests across `test_cleanup.py`
+and `test_runners.py`.
+
+**Rationale:** Skip-first-wins is the smallest patch that lossles­sly removes
+all 2,024 duplicate files (the audit verified bodies are byte-identical across
+copies). It also resolves synonym/subset duplicates as a free side effect:
+Bonfires, Player IDs, PSN, and Sorceries become empty after dedup and are
+dropped by the empty-category check, so no synonym normalizer is needed. The
+markdown-level cleanup additions match the same pattern as the existing
+`drop_empty_headings` / `drop_placeholder_sections` helpers — one regex per
+defect, slotted into the order-sensitive pipeline already validated by fixture
+tests. The heading-image dedupe lives inside `replace_images_with_alt` so the
+fix runs in HTML space (no markdown regex fragility) and never reaches
+`drop_empty_sections` with corrupted headings.
+
+**Alternatives considered:** Multi-value `categories: [...]` frontmatter with
+either accumulated writes or a flat output layout was rejected — keeping the
+existing per-category folder layout means no migration for downstream
+consumers, no rewrites of the stats browser, and the audit confirmed the
+cross-category info is not load-bearing for the AI-KB use case. A synonym
+normalizer that maps Bonfire↔Bonfires and Magic↔Sorceries was rejected because
+the dedup pass solves the same problem with zero heuristics. A larger
+`HUB_LINK_BLOCKLIST` / `CATEGORY_DISCOVERY_BLOCKLIST` covering every
+synonym was rejected for the same reason. A stub threshold higher than 200
+chars was rejected because the audit identified 11 stubs at <200 chars (0.3%
+of corpus); 200 leaves real-but-sparse pages alone.
+
+**Trade-offs:** First-encounter-wins means whichever category comes first in
+`args.category` order claims a URL. With sorted sidebar discovery, alphabetical
+order wins (Bonfire before Bonfires; Items before Weapons). If a user wants a
+specific category to "win" for a given page, they can reorder `--category`
+flags. Fix 9's stub guard only triggers in `clean=True` mode so `--no-clean`
+raw dumps still write whatever they extract. The expanded `_LABEL_NOISE_RE`
+strips `map` from alt text; on the rare page where that's load-bearing
+(e.g. a hub page about a literal in-game map), some context may be lost — the
+existing test fixtures confirm legitimate stat labels (Strength, Stability,
+Physical Defense) are unaffected.
+
 ## 2026-05-06 — Post-run folder stats browser
 
 **Context:** The scraper printed useful corpus totals after a run, but users

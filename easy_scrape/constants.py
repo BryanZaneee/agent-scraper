@@ -89,3 +89,17 @@ HUB_LINK_BLOCKLIST = (
     "/Help",
 )
 
+# Sidebar entries that look like categories but aren't real knowledge content
+# (zero/single-page meta hubs, scraper staging areas). Filtered out at sidebar
+# discovery so they never reach the picker. Synonym/subset duplicates
+# (Bonfires, PSN/Player IDs, Sorceries) are NOT listed here — the URL dedup
+# in run_category_mode plus the empty-category skip handles those for free.
+CATEGORY_DISCOVERY_BLOCKLIST = (
+    "Comedy",
+    "Build Calculator",
+    "Chatroom",
+    "Fan Art",
+    "Community Events",
+    "todo",
+)
+

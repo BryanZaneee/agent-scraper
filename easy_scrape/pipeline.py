@@ -149,9 +149,11 @@ def scrape_page(
         clean=options.clean,
         preserve_images=preserve_images,
     )
-    if not md:
-        print(f"  empty content at {url}", file=sys.stderr)
-        return ScrapeResult("failed", url, out_path, slug)
+    MIN_BODY_CHARS = 200
+    if not md or (options.clean and len(md) < MIN_BODY_CHARS):
+        reason = "empty" if not md else f"stub ({len(md)} chars)"
+        print(f"  {reason} content at {url}", file=sys.stderr)
+        return ScrapeResult("skipped", url, out_path, slug)
 
     if tui is not None:
         tui.update_stage("writing", str(out_path))
@@ -179,6 +181,7 @@ def scrape_pages(
     *,
     label: str = "",
     tui: "ScrapeRainTui | None" = None,
+    seen_urls: set[str] | None = None,
 ) -> ScrapeBatchResult:
     """Save each URL into out_dir/<slug>.md and return structured totals."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -202,6 +205,8 @@ def scrape_pages(
 
         result = scrape_page(session, url, path, options, tui=tui)
         batch.record(result)
+        if seen_urls is not None and result.status in ("saved", "skipped"):
+            seen_urls.add(url)
 
         if result.status == "saved":
             if not (tui is not None and tui.active):

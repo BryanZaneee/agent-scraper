@@ -257,6 +257,11 @@ def replace_images_with_alt(element) -> None:
     headers — without alt-text fallback, those columns become unlabeled values).
     The alt text is cleaned of game-name and 'icon' noise before insertion so
     the rendered markdown table is readable.
+
+    When the image lives inside a heading and the heading already contains
+    the cleaned alt text (case-insensitive), the alt is decorative duplication
+    of the rendered title — decompose instead of stuttering the heading like
+    `## griggs of vinheim Griggs of Vinheim`.
     """
     for img in list(element.find_all("img")):
         if img.get(PRESERVED_IMAGE_ATTR) == "1":
@@ -266,10 +271,18 @@ def replace_images_with_alt(element) -> None:
             img.decompose()
             continue
         cleaned = _clean_label(alt)
-        if cleaned:
-            img.replace_with(cleaned)
-        else:
+        if not cleaned:
             img.decompose()
+            continue
+        heading = img.find_parent(["h1", "h2", "h3", "h4", "h5", "h6"])
+        if heading is not None:
+            heading_text = " ".join(
+                s.strip() for s in heading.stripped_strings if s.strip()
+            )
+            if cleaned.lower() in heading_text.lower():
+                img.decompose()
+                continue
+        img.replace_with(cleaned)
 
 
 _BANNER_ROW_RE = re.compile(r"^(?:Boss|NPC|Item|Image)\s+\d+\b")
@@ -414,7 +427,8 @@ def _cell_text(cell) -> str:
 
 
 _LABEL_NOISE_RE = re.compile(
-    r"\b(?:dark\s+souls(?:\s+remastered)?|icon|ds)\b",
+    r"\b(?:dark\s+souls(?:\s+remastered)?|icon|ds|wiki|guide|"
+    r"walkthrough|map|png|jpe?g|gif|webp)\b",
     flags=re.IGNORECASE,
 )
 
@@ -712,6 +726,61 @@ def drop_empty_headings(md: str) -> str:
     return _EMPTY_HEADING_RE.sub("", md)
 
 
+_EMPTY_SECTION_RE = re.compile(
+    r"^#{1,6}[ \t]+[^\n]+\n+(?=#{1,6}[ \t]|\Z)",
+    flags=re.MULTILINE,
+)
+
+
+def drop_empty_sections(md: str) -> str:
+    """Drop heading lines whose body is empty (next thing is another heading or EOF).
+
+    Catches stubs like `### Video Walkthrough` when the wiki page never filled
+    them in. Iterates because dropping one empty heading can expose another
+    underneath (`### A\\n### B\\n### C` collapses fully).
+    """
+    prev = None
+    out = md
+    while prev != out:
+        prev = out
+        out = _EMPTY_SECTION_RE.sub("", out)
+    return out
+
+
+_WIP_RE = re.compile(
+    r"\s*\((?:WIP|Work\s+in\s+progress)\)\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def strip_wip_tokens(md: str) -> str:
+    """Strip standalone (WIP) / (Work in progress) markers from markdown.
+
+    Removes the token in-line; if the line is left empty, drops it (but keeps
+    pre-existing blank lines so paragraph spacing survives).
+    """
+    out_lines = []
+    for line in md.splitlines():
+        cleaned = _WIP_RE.sub(" ", line)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).rstrip()
+        if cleaned.strip():
+            out_lines.append(cleaned)
+        elif line.strip() == "":
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+_EXTERNAL_IMAGE_LINE_RE = re.compile(
+    r"^\s*external\s+image\s+[0-9a-f]{6,}\s+(?:jpe?g|png|gif|webp)\s*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+
+def drop_external_image_placeholders(md: str) -> str:
+    """Remove residue lines like `external image 3f2a9c jpg` from markdown."""
+    return _EXTERNAL_IMAGE_LINE_RE.sub("", md)
+
+
 @dataclass(frozen=True)
 class CleanupPipelineContext:
     """Context shared by ordered HTML cleanup steps."""
@@ -837,6 +906,9 @@ def html_to_markdown(
         )
         md = drop_empty_headings(md)
         md = drop_placeholder_sections(md)
+        md = drop_empty_sections(md)
+        md = strip_wip_tokens(md)
+        md = drop_external_image_placeholders(md)
         md = re.sub(r"\n{3,}", "\n\n", md).strip()
     return md
 

@@ -1,13 +1,17 @@
 # Easy Scrape
 
-A flexible wiki scraper that converts web content into clean, AI-friendly
-Markdown files. Currently supports [Fextralife](https://fextralife.com) wiki
-subdomains, with extensibility for other sites. Reads only the article body,
-normalizes noisy Fextralife markup, extracts useful stats into YAML
-frontmatter, and writes one `.md` per page.
+A terminal-first web scraper that converts pages into clean, AI-friendly
+Markdown files. Reads only the article body, normalizes noisy markup,
+extracts useful stats into YAML frontmatter, writes one `.md` per page, and
+ends every run with a token summary so you can compare collections over time.
 
-Tested on Dark Souls, Elden Ring, and Bloodborne — works on any wiki on
-the `*.wiki.fextralife.com` infrastructure.
+The cleanup pipeline, sidebar discovery, and category browsing are organized
+as named pipeline steps inside the `easy_scrape` package, designed to be
+extended with adapters for additional sites. The first included adapter targets
+[Fextralife](https://fextralife.com) wiki subdomains (`*.wiki.fextralife.com`)
+and is tested on Dark Souls, Elden Ring, and Bloodborne. Other sites with a
+single article-body container are usable today via `--base` plus `--no-clean`,
+or by adding a site-specific cleanup module.
 
 ## Setup
 
@@ -18,8 +22,8 @@ python3 -m venv .venv
 
 ## Pick your source
 
-Use `--base` to point at any wiki or website to scrape. Currently optimized for
-Fextralife subdomains — some examples:
+Use `--base` to point at any site you want to scrape. The bundled adapter is
+optimized for Fextralife subdomains — for example:
 
 ```
 https://darksouls.wiki.fextralife.com           (Dark Souls — default)
@@ -32,8 +36,10 @@ https://nioh2.wiki.fextralife.com               (Nioh 2)
 https://lordsofthefallen.wiki.fextralife.com    (Lords of the Fallen)
 ```
 
-If the wiki you want isn't listed: open it in a browser, copy the base URL
-(everything before the first `/<page>` segment), and pass it via `--base`.
+For other sites: open the page in a browser, copy the base URL (everything
+before the first `/<page>` segment), and pass it via `--base`. If the site does
+not match the bundled cleanup rules, pass `--no-clean` to get raw markdownify
+output, or add a site-specific cleanup module under `easy_scrape/`.
 
 ## Workflow
 
@@ -46,10 +52,10 @@ Run the script with no flags to open the interactive picker:
 ```
 
 The TUI opens with an `easyScrape` banner, light rain/cloud effects, and a
-source picker. It lets you choose the default Dark Souls Fextralife wiki or
-enter a custom base URL, discovers the wiki sidebar categories, and gives you a
-multi-select category list. Before scraping starts, it asks where to write the
-files with an in-terminal folder browser. The default action writes to
+source picker. It lets you choose the default Fextralife wiki or enter a custom
+base URL, discovers the site's sidebar categories, and gives you a multi-select
+category list. Before scraping starts, it asks where to write the files with an
+in-terminal folder browser. The default action writes to
 `~/Desktop/easy_scrape_output`; you can also browse folders, use the current
 folder, create a named child folder, or type an existing path directly. Use
 `up/down` or `j/k` to move, `space` to toggle categories, the `All` row or `a`
@@ -77,20 +83,20 @@ category folders and animated progress dashboard as scripted category mode.
 
 ### Scripted workflow
 
-#### 1. Discover what categories the wiki has
+#### 1. Discover what categories the site has
 
 ```bash
-.venv/bin/python scrape.py --base <wiki-url> --discover
+.venv/bin/python scrape.py --base <site-url> --discover
 ```
 
-This prints the wiki's sidebar nav as a flat list of category names —
-typically 60-100 entries like `Weapons`, `Armor`, `Bosses`, `Spells`,
-`Rings`, etc. Pick the ones you want.
+This prints the site's sidebar nav as a flat list of category names. For
+Fextralife wikis that is typically 60-100 entries like `Weapons`, `Armor`,
+`Bosses`, `Spells`, `Rings`, etc. Pick the ones you want.
 
 #### 2. Preview a category before committing
 
 ```bash
-.venv/bin/python scrape.py --base <wiki-url> --category Weapons --list-only
+.venv/bin/python scrape.py --base <site-url> --category Weapons --list-only
 ```
 
 Prints the URLs that would be downloaded — sanity-check that the hub gives
@@ -101,7 +107,7 @@ than to individual pages).
 
 ```bash
 .venv/bin/python scrape.py \
-  --base <wiki-url> \
+  --base <site-url> \
   --category Weapons \
   --category Armor \
   --category Bosses
@@ -121,7 +127,9 @@ Clean-mode output is the default. It adds YAML frontmatter with the page title,
 source URL, category, and best-effort table stats; removes inline links while
 preserving their visible text; strips footer navigation tables and sidebar leak
 links; promotes useful image alt text into table labels; normalizes repeated
-game-name headings; and drops placeholder sections such as `N/A` notes.
+heading patterns; and drops placeholder sections such as `N/A` notes. The
+included cleanup rules are tuned for Fextralife markup; other sites should use
+`--no-clean` until a matching adapter exists.
 
 Every scrape run ends with a token summary for the final Markdown collection:
 Markdown file count, bytes, characters, words, estimated tokens, a compact
@@ -171,11 +179,10 @@ references into the Markdown, such as:
 
 ### Or scrape everything (sitemap mode)
 
-If you want every page in the wiki, pass an explicit flag such as `--base` and
-drop `--category`:
+If you want every page on a site, pass `--base` and drop `--category`:
 
 ```bash
-.venv/bin/python scrape.py --base <wiki-url>
+.venv/bin/python scrape.py --base <site-url>
 ```
 
 This reads `/sitemap.xml` and saves every page into a single flat folder.
@@ -189,7 +196,7 @@ Use `--stats-only` to inspect an existing output folder without fetching pages:
 .venv/bin/python scrape.py --out output --stats-only
 ```
 
-This is useful after cleanup iterations or when comparing category-specific
+This is useful after cleanup iterations or when comparing source-specific
 collections for an AI agent knowledge base.
 
 ## Iterating on cleanup
@@ -207,7 +214,8 @@ same URLs.
 ```
 
 Use `--no-clean` when you need the older raw-ish markdownify output with a
-simple title/source header and no YAML frontmatter.
+simple title/source header and no YAML frontmatter — useful when scraping a
+site that the bundled cleanup rules don't yet target.
 
 ## Worked example: Elden Ring
 
@@ -232,7 +240,7 @@ simple title/source header and no YAML frontmatter.
 
 | flag           | default                                 | purpose                                  |
 | -------------- | --------------------------------------- | ---------------------------------------- |
-| `--base`       | `https://darksouls.wiki.fextralife.com` | wiki subdomain                           |
+| `--base`       | `https://darksouls.wiki.fextralife.com` | site base URL                            |
 | `--out`        | `~/Desktop/easy_scrape_output`          | output directory                         |
 | `--category`   | none                                    | hub name; repeat to scrape several       |
 | `--discover`   | off                                     | print sidebar categories, do nothing else |
@@ -250,21 +258,22 @@ simple title/source header and no YAML frontmatter.
 | `--no-tui`     | off                                     | disable animated rain progress UI        |
 | `--no-clean`   | off                                     | skip cleanup/YAML frontmatter pass       |
 
-Category names with spaces use the wiki's URL form: `Ashes+of+War`,
-`Boss+Souls`, etc. Use the names exactly as shown by `--discover`.
+Category names with spaces use the URL form: `Ashes+of+War`, `Boss+Souls`, etc.
+Use the names exactly as shown by `--discover`.
 
 ## How it works
 
 1. **Choose URL source** — the no-arg interactive picker discovers categories
-   first; scripted modes use `/sitemap.xml` for the whole wiki, or a hub page
+   first; scripted modes use `/sitemap.xml` for the whole site, or a hub page
    (e.g. `/Weapons`) plus its in-content links for category mode.
 2. **Fetch the page** with browser-like headers; auto-retry on 429/5xx.
 3. **Fetch or replay** the raw HTML, optionally using `--cache-dir`.
-4. **Extract** only `<div id="wiki-content-block">` (the article body).
-5. **Clean** Fextralife noise: expand rowspans, preserve useful image alt text,
-   optionally download content images, drop banner/footer/sidebar clutter,
-   unwrap inline links, collapse empty table columns, normalize headings, and
-   remove placeholder sections.
+4. **Extract** the article body container (currently `#wiki-content-block`,
+   used by the bundled Fextralife adapter).
+5. **Clean** site-specific noise via the named cleanup pipeline: expand
+   rowspans, preserve useful image alt text, optionally download content
+   images, drop banner/footer/sidebar clutter, unwrap inline links, collapse
+   empty table columns, normalize headings, and remove placeholder sections.
 6. **Extract frontmatter** from the first page-owned stat table when possible.
 7. **Convert** HTML to Markdown via `markdownify`.
 8. **Save** as `<slug>.md` with YAML frontmatter in clean mode.
@@ -277,10 +286,23 @@ Category names with spaces use the wiki's URL form: `Ashes+of+War`,
 12. **Politeness:** 1s default delay, retry/backoff, skip files that
    already exist (so you can interrupt and resume safely).
 
+## Extending to other sites
+
+The package is split so that adding a new site adapter is mostly a matter of
+extending the cleanup pipeline:
+
+- `easy_scrape/constants.py` — the article-body selector and default base URL
+- `easy_scrape/cleanup.py` — named pipeline steps that run in order
+- `easy_scrape/fetching.py` — sidebar discovery and URL extraction
+- `easy_scrape/pipeline.py` — `ScrapeOptions` / `ScrapeResult` orchestration
+
+Until a site has a matching cleanup module, `--no-clean` produces a usable
+markdownify dump with a simple title/source header.
+
 ## Tests
 
 Fixture-based regression tests cover the cleanup behavior for representative
-Dark Souls pages:
+pages, plus unit tests for the runners, stats layer, and TUI primitives:
 
 ```bash
 .venv/bin/pytest
@@ -295,5 +317,7 @@ Dark Souls pages:
 - Hub pages can still include some "noise" links (related categories, helper
   pages). Clean mode removes the common sidebar/footer patterns, but use
   `--list-only` before large runs when a category may be a meta-index.
-- The `#wiki-content-block` selector is shared across all Fextralife
-  wikis, so the scraper itself doesn't need per-wiki tweaks.
+- The bundled `#wiki-content-block` selector is the Fextralife article-body
+  container, so the same adapter works across every Fextralife wiki without
+  per-game tweaks. Other sites need either `--no-clean` or a site-specific
+  cleanup module.
